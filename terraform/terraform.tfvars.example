@@ -1,0 +1,143 @@
+# Example Terraform variables file for Homebrew Bottles Sync System
+# Copy this file to terraform.tfvars and customize the values for your deployment
+
+# Project Configuration
+project_name = "homebrew-bottles-sync"
+environment  = "prod"
+aws_region   = "us-east-1"
+
+# Additional tags for all resources
+tags = {
+  Owner       = "devops-team"
+  CostCenter  = "infrastructure"
+  Project     = "homebrew-mirror"
+  Environment = "production"
+}
+
+# Network Configuration
+vpc_cidr               = "10.0.0.0/16"
+public_subnet_cidrs    = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs   = ["10.0.10.0/24", "10.0.20.0/24"]
+enable_nat_gateway     = true
+
+# Availability zones (leave empty to use first 2 AZs in region)
+# availability_zones = ["us-east-1a", "us-east-1b"]
+
+# S3 Configuration
+s3_enable_versioning                   = true
+s3_lifecycle_expiration_days           = 90
+s3_noncurrent_version_expiration_days  = 30
+s3_enable_access_logging               = false
+# s3_access_log_bucket                 = "my-access-logs-bucket"
+# s3_kms_key_id                        = "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+
+# Lambda Configuration
+lambda_layer_zip_path             = "../lambda/layer.zip"
+lambda_orchestrator_zip_path      = "../lambda/orchestrator.zip"
+lambda_sync_zip_path              = "../lambda/sync.zip"
+python_runtime                    = "python3.11"
+lambda_orchestrator_timeout       = 300   # 5 minutes
+lambda_orchestrator_memory_size    = 512
+lambda_sync_timeout               = 900   # 15 minutes (maximum)
+lambda_sync_memory_size           = 3008  # Maximum memory
+lambda_enable_dlq                 = true
+lambda_max_retry_attempts         = 2
+
+# ECS Configuration
+ecs_container_image               = "123456789012.dkr.ecr.us-east-1.amazonaws.com/homebrew-bottles-sync:latest"
+ecs_enable_container_insights     = true
+ecs_fargate_base_capacity         = 1
+ecs_fargate_weight                = 1
+ecs_enable_fargate_spot           = true
+ecs_fargate_spot_base_capacity    = 0
+ecs_fargate_spot_weight           = 2
+ecs_task_cpu                      = 2048  # 2 vCPUs
+ecs_task_memory                   = 8192  # 8 GB
+ecs_ephemeral_storage_size_gb     = 100
+ecs_stop_timeout                  = 120
+ecs_enable_efs                    = true
+ecs_efs_performance_mode          = "generalPurpose"
+ecs_efs_throughput_mode           = "bursting"
+ecs_efs_transition_to_ia          = "AFTER_30_DAYS"
+
+# Application Configuration
+target_platforms = [
+  "arm64_sonoma",
+  "arm64_ventura", 
+  "monterey"
+]
+size_threshold_gb           = 20
+max_concurrent_downloads    = 10
+retry_attempts             = 3
+progress_report_interval   = 300  # 5 minutes
+
+# EventBridge Configuration
+schedule_expression                      = "cron(0 3 ? * SUN *)"  # Sunday at 03:00 UTC
+eventbridge_rule_state                   = "ENABLED"
+eventbridge_max_retry_attempts           = 3
+eventbridge_max_event_age_seconds        = 3600  # 1 hour
+eventbridge_enable_logging               = false
+eventbridge_enable_failure_alarm         = true
+eventbridge_enable_missed_schedule_alarm = true
+
+# Notifications Configuration
+# slack_webhook_url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
+slack_channel                    = "#homebrew-sync"
+slack_username                   = "Homebrew Sync Bot"
+secret_recovery_window_days      = 7
+enable_secret_rotation           = false
+secret_rotation_days             = 90
+enable_sns_notifications         = false
+# notification_email_addresses   = ["devops@company.com", "alerts@company.com"]
+# notifications_kms_key_id       = "arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012"
+enable_cross_region_backup       = false
+# backup_region                  = "us-west-2"
+
+# Logging and Monitoring Configuration
+log_retention_days        = 14
+log_level                = "INFO"
+enable_cloudwatch_alarms = true
+# monitoring_alert_email   = "alerts@company.com"
+
+# Development Environment Example
+# Uncomment and modify these values for a development deployment:
+
+# project_name = "homebrew-bottles-sync"
+# environment  = "dev"
+# aws_region   = "us-west-2"
+
+# # Smaller resources for development
+# ecs_task_cpu                    = 1024  # 1 vCPU
+# ecs_task_memory                 = 4096  # 4 GB
+# ecs_ephemeral_storage_size_gb   = 50
+# lambda_orchestrator_memory_size = 256
+# lambda_sync_memory_size         = 1024
+# size_threshold_gb               = 5     # Lower threshold for testing
+# max_concurrent_downloads        = 5
+
+# # More frequent schedule for testing
+# schedule_expression = "cron(0 */6 * * ? *)"  # Every 6 hours
+
+# # Shorter log retention for cost savings
+# log_retention_days = 7
+
+# Staging Environment Example
+# Uncomment and modify these values for a staging deployment:
+
+# project_name = "homebrew-bottles-sync"
+# environment  = "staging"
+# aws_region   = "us-east-1"
+
+# # Production-like resources but with cost optimizations
+# ecs_task_cpu                    = 1024  # 1 vCPU
+# ecs_task_memory                 = 4096  # 4 GB
+# ecs_enable_fargate_spot         = true
+# ecs_fargate_spot_weight         = 3     # Prefer spot instances
+# lambda_sync_memory_size         = 2048
+
+# # Weekly schedule but different day to avoid conflicts
+# schedule_expression = "cron(0 3 ? * SAT *)"  # Saturday at 03:00 UTC
+
+# # Enable monitoring but with email notifications
+# enable_sns_notifications = true
+# notification_email_addresses = ["staging-alerts@company.com"]
