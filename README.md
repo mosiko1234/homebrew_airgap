@@ -97,128 +97,100 @@ graph TB
 ```mermaid
 graph TB
     %% AWS Account & Region
-    AWS[AWS Account<br/>us-east-1]
+    AWS[AWS Account us-east-1]
     
     %% VPC & Networking
-    subgraph VPC["🌐 VPC (10.0.0.0/16)"]
+    subgraph VPC["VPC Network 10.0.0.0/16"]
         subgraph AZ1["Availability Zone 1a"]
-            PUB1[Public Subnet<br/>10.0.1.0/24<br/>NAT Gateway]
-            PRIV1[Private Subnet<br/>10.0.10.0/24<br/>ECS Tasks]
+            PUB1[Public Subnet<br/>10.0.1.0/24]
+            PRIV1[Private Subnet<br/>10.0.10.0/24]
         end
         
         subgraph AZ2["Availability Zone 1b"]
-            PUB2[Public Subnet<br/>10.0.2.0/24<br/>NAT Gateway]
-            PRIV2[Private Subnet<br/>10.0.20.0/24<br/>ECS Tasks]
+            PUB2[Public Subnet<br/>10.0.2.0/24]
+            PRIV2[Private Subnet<br/>10.0.20.0/24]
         end
         
         IGW[Internet Gateway]
         NAT1[NAT Gateway 1]
         NAT2[NAT Gateway 2]
-        
-        IGW --> PUB1
-        IGW --> PUB2
-        PUB1 --> NAT1
-        PUB2 --> NAT2
-        NAT1 --> PRIV1
-        NAT2 --> PRIV2
     end
     
     %% Compute Services
-    subgraph COMPUTE["💻 Compute Services"]
-        subgraph LAMBDA["Lambda Functions"]
-            ORCH_L[Orchestrator Function<br/>512MB, 5min timeout<br/>Python 3.11]
-            SYNC_L[Sync Worker Function<br/>3GB, 15min timeout<br/>Python 3.11]
-            LAYER[Shared Dependencies Layer<br/>boto3, requests, etc.]
-        end
+    subgraph COMPUTE["Compute Services"]
+        ORCH_L[Lambda Orchestrator<br/>512MB - 5min timeout]
+        SYNC_L[Lambda Sync Worker<br/>3GB - 15min timeout]
+        LAYER[Shared Dependencies Layer]
         
-        subgraph ECS_CLUSTER["ECS Fargate Cluster"]
-            CLUSTER[homebrew-sync-cluster<br/>Container Insights Enabled]
-            TASK_DEF[Task Definition<br/>2 vCPU, 8GB RAM<br/>100GB Ephemeral Storage]
-            SERVICE[ECS Service<br/>Auto Scaling<br/>Fargate + Spot]
-        end
+        CLUSTER[ECS Fargate Cluster<br/>Container Insights]
+        TASK_DEF[ECS Task Definition<br/>2 vCPU - 8GB RAM]
     end
     
     %% Storage Services
-    subgraph STORAGE["🗄️ Storage Services"]
-        S3_MAIN[S3 Main Bucket<br/>homebrew-bottles-prod-{account}<br/>• Versioning Enabled<br/>• Server-Side Encryption<br/>• Lifecycle Policies<br/>• Access Logging]
-        
-        S3_LOGS[S3 Access Logs Bucket<br/>homebrew-bottles-logs-{account}<br/>• Log Retention<br/>• Cost Optimization]
-        
-        EFS_FS[EFS File System<br/>• Encrypted at Rest<br/>• General Purpose<br/>• Bursting Throughput<br/>• IA Transition: 30 days]
-        
-        EFS_AP[EFS Access Point<br/>• POSIX User: 1000:1000<br/>• Root Directory: /homebrew-sync<br/>• Permissions: 755]
+    subgraph STORAGE["Storage Services"]
+        S3_MAIN[S3 Main Bucket<br/>Versioning + Encryption<br/>Lifecycle Policies]
+        S3_LOGS[S3 Access Logs Bucket]
+        EFS_FS[EFS File System<br/>Encrypted + IA Transition]
+        EFS_AP[EFS Access Point<br/>POSIX 1000:1000]
     end
     
     %% Security & Access
-    subgraph SECURITY["🔐 Security & Access"]
-        subgraph IAM_ROLES["IAM Roles"]
-            LAMBDA_EXEC[Lambda Execution Role<br/>• CloudWatch Logs<br/>• VPC Access<br/>• Layer Access]
-            
-            LAMBDA_ORCH[Lambda Orchestrator Role<br/>• S3 Read/Write<br/>• ECS RunTask<br/>• Lambda Invoke<br/>• Secrets Manager]
-            
-            LAMBDA_SYNC[Lambda Sync Role<br/>• S3 Read/Write<br/>• Secrets Manager<br/>• CloudWatch Metrics]
-            
-            ECS_EXEC[ECS Task Execution Role<br/>• ECR Pull<br/>• CloudWatch Logs<br/>• Secrets Manager]
-            
-            ECS_TASK[ECS Task Role<br/>• S3 Read/Write<br/>• EFS Access<br/>• Secrets Manager<br/>• CloudWatch Metrics]
-        end
+    subgraph SECURITY["Security & Access"]
+        LAMBDA_EXEC[Lambda Execution Role]
+        LAMBDA_ORCH[Lambda Orchestrator Role]
+        LAMBDA_SYNC[Lambda Sync Role]
+        ECS_EXEC[ECS Task Execution Role]
+        ECS_TASK[ECS Task Role]
         
-        subgraph SECURITY_GROUPS["Security Groups"]
-            ECS_SG[ECS Tasks Security Group<br/>• Outbound: 80, 443<br/>• EFS: 2049<br/>• No Inbound]
-            
-            EFS_SG[EFS Security Group<br/>• Inbound: 2049 from ECS<br/>• Encrypted Transit]
-        end
+        ECS_SG[ECS Security Group<br/>Outbound 80,443,2049]
+        EFS_SG[EFS Security Group<br/>Inbound 2049]
         
-        SECRETS[Secrets Manager<br/>• Slack Webhook URL<br/>• Automatic Rotation<br/>• Cross-Region Backup<br/>• KMS Encryption]
+        SECRETS[Secrets Manager<br/>Slack Webhook + KMS]
     end
     
     %% Monitoring & Logging
-    subgraph MONITORING["📊 Monitoring & Logging"]
-        subgraph CLOUDWATCH["CloudWatch"]
-            CW_LOGS[Log Groups<br/>• /aws/lambda/orchestrator<br/>• /aws/lambda/sync<br/>• /aws/ecs/homebrew-sync<br/>• 14 days retention]
-            
-            CW_METRICS[Custom Metrics<br/>• Sync Duration<br/>• Bottles Downloaded<br/>• Error Rates<br/>• Cost Tracking]
-            
-            CW_ALARMS[CloudWatch Alarms<br/>• Lambda Errors<br/>• ECS Task Failures<br/>• High CPU/Memory<br/>• Cost Thresholds]
-            
-            CW_DASHBOARD[CloudWatch Dashboard<br/>• Real-time Metrics<br/>• Historical Trends<br/>• Cost Analysis]
-        end
-        
-        SNS_TOPIC[SNS Topic<br/>• Email Notifications<br/>• System Alerts<br/>• Cost Notifications<br/>• Security Events]
+    subgraph MONITORING["Monitoring & Logging"]
+        CW_LOGS[CloudWatch Log Groups<br/>14 days retention]
+        CW_METRICS[Custom Metrics<br/>Sync stats + costs]
+        CW_ALARMS[CloudWatch Alarms<br/>Errors + thresholds]
+        CW_DASHBOARD[CloudWatch Dashboard]
+        SNS_TOPIC[SNS Topic<br/>Email notifications]
     end
     
     %% Scheduling & Events
-    subgraph EVENTS["⏰ Scheduling & Events"]
-        EB_RULE[EventBridge Rule<br/>• Schedule: cron(0 3 ? * SUN *)<br/>• Target: Lambda Orchestrator<br/>• Retry Policy<br/>• DLQ Support]
-        
-        EB_DLQ[EventBridge DLQ<br/>• Failed Invocations<br/>• Manual Retry<br/>• Alert Integration]
+    subgraph EVENTS["Scheduling & Events"]
+        EB_RULE[EventBridge Rule<br/>Weekly Sunday 3AM UTC]
+        EB_DLQ[EventBridge DLQ<br/>Failed invocations]
     end
     
     %% External Integrations
-    subgraph EXTERNAL["🌍 External Integrations"]
-        HOMEBREW[Homebrew API<br/>formulae.brew.sh<br/>• HTTPS Only<br/>• Rate Limiting<br/>• JSON Responses]
-        
-        SLACK_WH[Slack Webhook<br/>• Rich Notifications<br/>• Error Alerts<br/>• Progress Updates]
-        
-        EXT_HASH[External Hash Sources<br/>• S3 Cross-Account<br/>• HTTPS URLs<br/>• Validation & Migration]
+    subgraph EXTERNAL["External Integrations"]
+        HOMEBREW[Homebrew API<br/>formulae.brew.sh]
+        SLACK_WH[Slack Webhook<br/>Rich notifications]
+        EXT_HASH[External Hash Sources<br/>S3 + HTTPS URLs]
     end
     
-    %% Connections - Networking
+    %% Network Connections
     AWS --> VPC
+    IGW --> PUB1
+    IGW --> PUB2
+    PUB1 --> NAT1
+    PUB2 --> NAT2
+    NAT1 --> PRIV1
+    NAT2 --> PRIV2
     
-    %% Connections - Compute
+    %% Compute Connections
     ORCH_L -.-> LAYER
     SYNC_L -.-> LAYER
     TASK_DEF --> CLUSTER
-    SERVICE --> CLUSTER
     
-    %% Connections - Storage
+    %% Storage Connections
     S3_MAIN --> S3_LOGS
     EFS_FS --> EFS_AP
     EFS_AP --> PRIV1
     EFS_AP --> PRIV2
     
-    %% Connections - Security
+    %% Security Connections
     LAMBDA_ORCH --> LAMBDA_EXEC
     LAMBDA_SYNC --> LAMBDA_EXEC
     ECS_TASK --> ECS_EXEC
@@ -226,21 +198,21 @@ graph TB
     ECS_SG --> PRIV2
     EFS_SG --> EFS_FS
     
-    %% Connections - Monitoring
+    %% Monitoring Connections
     CW_ALARMS --> SNS_TOPIC
     CW_METRICS --> CW_DASHBOARD
     
-    %% Connections - Events
+    %% Event Connections
     EB_RULE --> ORCH_L
     EB_RULE --> EB_DLQ
     
-    %% Connections - External
+    %% External Connections
     ORCH_L --> HOMEBREW
     ORCH_L --> EXT_HASH
     SYNC_L --> SLACK_WH
     TASK_DEF --> SLACK_WH
     
-    %% Connections - Data Flow
+    %% Data Flow Connections
     ORCH_L --> S3_MAIN
     SYNC_L --> S3_MAIN
     TASK_DEF --> S3_MAIN
@@ -264,10 +236,10 @@ graph TB
     classDef external fill:#fce4ec
     
     class VPC,AZ1,AZ2,PUB1,PUB2,PRIV1,PRIV2,IGW,NAT1,NAT2 vpc
-    class COMPUTE,LAMBDA,ECS_CLUSTER,ORCH_L,SYNC_L,LAYER,CLUSTER,TASK_DEF,SERVICE compute
+    class COMPUTE,ORCH_L,SYNC_L,LAYER,CLUSTER,TASK_DEF compute
     class STORAGE,S3_MAIN,S3_LOGS,EFS_FS,EFS_AP storage
-    class SECURITY,IAM_ROLES,SECURITY_GROUPS,LAMBDA_EXEC,LAMBDA_ORCH,LAMBDA_SYNC,ECS_EXEC,ECS_TASK,ECS_SG,EFS_SG,SECRETS security
-    class MONITORING,CLOUDWATCH,CW_LOGS,CW_METRICS,CW_ALARMS,CW_DASHBOARD,SNS_TOPIC monitoring
+    class SECURITY,LAMBDA_EXEC,LAMBDA_ORCH,LAMBDA_SYNC,ECS_EXEC,ECS_TASK,ECS_SG,EFS_SG,SECRETS security
+    class MONITORING,CW_LOGS,CW_METRICS,CW_ALARMS,CW_DASHBOARD,SNS_TOPIC monitoring
     class EVENTS,EB_RULE,EB_DLQ events
     class EXTERNAL,HOMEBREW,SLACK_WH,EXT_HASH external
 ```
