@@ -81,8 +81,8 @@ eventbridge_enable_failure_alarm         = true
 eventbridge_enable_missed_schedule_alarm = true
 
 # Notifications Configuration
-# slack_webhook_url = "https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
-slack_channel                    = "#homebrew-sync"
+# slack_webhook_url = "https://hooks.slack.com/services/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"
+slack_channel                    = "#platform-updates"
 slack_username                   = "Homebrew Sync Bot"
 secret_recovery_window_days      = 7
 enable_secret_rotation           = false

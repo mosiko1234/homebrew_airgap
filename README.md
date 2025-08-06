@@ -15,16 +15,221 @@ An AWS-based automated solution that downloads and mirrors Homebrew bottles for 
 
 ## Architecture Overview
 
-```
-EventBridge → Lambda Orchestrator → [Lambda Sync | ECS Sync] → S3 Storage
-                     ↓
-              Slack Notifications
+### High-Level System Flow
+
+```mermaid
+graph TB
+    %% External Sources
+    HB[Homebrew API<br/>formulae.brew.sh] 
+    EXT[External Hash File<br/>S3/HTTPS]
+    
+    %% Scheduling & Orchestration
+    EB[EventBridge<br/>Weekly Schedule<br/>Sunday 03:00 UTC]
+    
+    %% Core Processing
+    ORCH[Lambda Orchestrator<br/>- Fetch formulas<br/>- Load hash file<br/>- Size estimation<br/>- Route decision]
+    
+    %% Sync Workers
+    LS[Lambda Sync Worker<br/>Downloads < 20GB<br/>- Concurrent downloads<br/>- SHA validation<br/>- S3 upload]
+    
+    ECS[ECS Fargate Sync<br/>Downloads ≥ 20GB<br/>- Batch processing<br/>- Progress tracking<br/>- EFS temp storage]
+    
+    %% Storage & State
+    S3[S3 Bucket<br/>- Date-based folders<br/>- Bottle files<br/>- Hash tracking<br/>- Lifecycle policies]
+    
+    HASH[bottles_hash.json<br/>- SHA256 checksums<br/>- Download dates<br/>- Duplicate prevention]
+    
+    %% Monitoring & Notifications
+    CW[CloudWatch<br/>- Logs<br/>- Metrics<br/>- Alarms<br/>- Dashboard]
+    
+    SLACK[Slack Notifications<br/>- Sync start/end<br/>- Progress updates<br/>- Error alerts]
+    
+    SNS[SNS Topics<br/>- Email alerts<br/>- System notifications]
+    
+    %% Infrastructure
+    VPC[VPC Network<br/>- Private subnets<br/>- NAT Gateway<br/>- Security groups]
+    
+    IAM[IAM Roles<br/>- Lambda execution<br/>- ECS task roles<br/>- S3 permissions]
+    
+    SM[Secrets Manager<br/>- Slack webhook<br/>- API keys]
+    
+    %% Flow connections
+    EB --> ORCH
+    HB --> ORCH
+    EXT -.-> ORCH
+    
+    ORCH --> |< 20GB| LS
+    ORCH --> |≥ 20GB| ECS
+    
+    LS --> S3
+    ECS --> S3
+    
+    S3 --> HASH
+    HASH --> ORCH
+    
+    ORCH --> SLACK
+    LS --> CW
+    ECS --> CW
+    CW --> SNS
+    CW --> SLACK
+    
+    ECS -.-> VPC
+    LS -.-> IAM
+    ECS -.-> IAM
+    SLACK -.-> SM
+    
+    %% Styling
+    classDef external fill:#e1f5fe
+    classDef compute fill:#f3e5f5
+    classDef storage fill:#e8f5e8
+    classDef monitoring fill:#fff3e0
+    classDef infrastructure fill:#fce4ec
+    
+    class HB,EXT external
+    class ORCH,LS,ECS compute
+    class S3,HASH,SM storage
+    class CW,SLACK,SNS monitoring
+    class VPC,IAM,EB infrastructure
 ```
 
-The system targets bottles for:
-- `arm64_sonoma` (macOS Sonoma on Apple Silicon)
-- `arm64_ventura` (macOS Ventura on Apple Silicon) 
-- `monterey` (macOS Monterey on Intel/Apple Silicon)
+### Detailed Component Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                              HOMEBREW BOTTLES SYNC SYSTEM                       │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                 │
+│  ┌─────────────────┐    ┌──────────────────────────────────────────────────┐   │
+│  │   SCHEDULING    │    │                 ORCHESTRATION                    │   │
+│  │                 │    │                                                  │   │
+│  │ ┌─────────────┐ │    │ ┌──────────────────────────────────────────────┐ │   │
+│  │ │ EventBridge │ │    │ │           Lambda Orchestrator                │ │   │
+│  │ │             │ │    │ │                                              │ │   │
+│  │ │ • Weekly    │ │    │ │ 1. Validate configuration                   │ │   │
+│  │ │   Schedule  │ │────┼─│ 2. Load existing hash file                  │ │   │
+│  │ │ • Manual    │ │    │ │ 3. Fetch formulas from Homebrew API        │ │   │
+│  │ │   Triggers  │ │    │ │ 4. Filter new bottles (SHA comparison)     │ │   │
+│  │ │ • Retry     │ │    │ │ 5. Estimate download size                   │ │   │
+│  │ │   Logic     │ │    │ │ 6. Route to Lambda or ECS                   │ │   │
+│  │ └─────────────┘ │    │ │ 7. Send notifications                       │ │   │
+│  └─────────────────┘    │ └──────────────────────────────────────────────┘ │   │
+│                         └──────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                            SYNC WORKERS                                 │   │
+│  │                                                                         │   │
+│  │ ┌─────────────────────────┐         ┌─────────────────────────────────┐ │   │
+│  │ │    Lambda Sync Worker   │         │       ECS Fargate Sync          │ │   │
+│  │ │                         │         │                                 │ │   │
+│  │ │ • Downloads < 20GB      │         │ • Downloads ≥ 20GB              │ │   │
+│  │ │ • 15min timeout         │         │ • Unlimited duration            │ │   │
+│  │ │ • 3GB memory max        │         │ • Up to 30GB memory             │ │   │
+│  │ │ • Concurrent downloads  │         │ • Batch processing              │ │   │
+│  │ │ • SHA256 validation     │         │ • Progress reporting            │ │   │
+│  │ │ • Direct S3 upload      │         │ • EFS temp storage              │ │   │
+│  │ │ • Error retry           │         │ • Graceful shutdown             │ │   │
+│  │ └─────────────────────────┘         │ • Auto-scaling                  │ │   │
+│  │                                     └─────────────────────────────────┘ │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                         STORAGE & STATE                                 │   │
+│  │                                                                         │   │
+│  │ ┌─────────────────────┐  ┌─────────────────────┐  ┌─────────────────┐  │   │
+│  │ │      S3 Bucket      │  │   bottles_hash.json │  │  External Hash  │  │   │
+│  │ │                     │  │                     │  │      Sources    │  │   │
+│  │ │ • Date folders      │  │ • SHA256 checksums  │  │                 │  │   │
+│  │ │   YYYY-MM-DD/       │  │ • Download dates    │  │ • S3 locations  │  │   │
+│  │ │ • Bottle files      │  │ • File sizes        │  │ • HTTPS URLs    │  │   │
+│  │ │   .bottle.tar.gz    │  │ • Last updated      │  │ • Migration     │  │   │
+│  │ │ • Versioning        │  │ • Atomic updates    │  │ • Validation    │  │   │
+│  │ │ • Lifecycle rules   │  │ • Corruption detect │  │ • Fallback      │  │   │
+│  │ │ • Encryption        │  │ • Backup/restore    │  │                 │  │   │
+│  │ └─────────────────────┘  └─────────────────────┘  └─────────────────┘  │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                      MONITORING & NOTIFICATIONS                         │   │
+│  │                                                                         │   │
+│  │ ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────────────────┐ │   │
+│  │ │   CloudWatch    │ │ Slack Webhooks  │ │         SNS Topics          │ │   │
+│  │ │                 │ │                 │ │                             │ │   │
+│  │ │ • Logs          │ │ • Sync start    │ │ • Email notifications       │ │   │
+│  │ │ • Metrics       │ │ • Progress      │ │ • System alerts             │ │   │
+│  │ │ • Alarms        │ │ • Success/fail  │ │ • Cost thresholds           │ │   │
+│  │ │ • Dashboard     │ │ • Error details │ │ • Security events           │ │   │
+│  │ │ • Insights      │ │ • Rich format   │ │ • Integration hooks         │ │   │
+│  │ └─────────────────┘ └─────────────────┘ └─────────────────────────────┘ │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────┐   │
+│  │                         INFRASTRUCTURE                                  │   │
+│  │                                                                         │   │
+│  │ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────────────┐ │   │
+│  │ │     VPC     │ │ IAM Roles   │ │   Secrets   │ │    EFS Storage      │ │   │
+│  │ │             │ │             │ │   Manager   │ │                     │ │   │
+│  │ │ • Private   │ │ • Lambda    │ │             │ │ • Temp files        │ │   │
+│  │ │   subnets   │ │   execution │ │ • Slack     │ │ • ECS mount         │ │   │
+│  │ │ • NAT GW    │ │ • ECS task  │ │   webhook   │ │ • Auto cleanup      │ │   │
+│  │ │ • Security  │ │ • S3 access │ │ • API keys  │ │ • Encryption        │ │   │
+│  │ │   groups    │ │ • Least     │ │ • Rotation  │ │ • Performance       │ │   │
+│  │ │ • NACLs     │ │   privilege │ │ • Backup    │ │   modes             │ │   │
+│  │ └─────────────┘ └─────────────┘ └─────────────┘ └─────────────────────┘ │   │
+│  └─────────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Data Flow Sequence
+
+```
+1. TRIGGER (Weekly/Manual)
+   EventBridge → Lambda Orchestrator
+   
+2. INITIALIZATION
+   Orchestrator → Load Configuration
+   Orchestrator → Load Hash File (S3/External)
+   Orchestrator → Fetch Formulas (Homebrew API)
+   
+3. PLANNING
+   Orchestrator → Filter New Bottles (SHA comparison)
+   Orchestrator → Estimate Download Size
+   Orchestrator → Send Start Notification (Slack)
+   
+4. ROUTING DECISION
+   IF size < 20GB:
+     Orchestrator → Lambda Sync Worker
+   ELSE:
+     Orchestrator → ECS Fargate Task
+   
+5. DOWNLOAD EXECUTION
+   Sync Worker → Download Bottles (Parallel)
+   Sync Worker → Validate SHA256
+   Sync Worker → Upload to S3 (Date folder)
+   Sync Worker → Update Hash File
+   
+6. COMPLETION
+   Sync Worker → Send Success/Failure (Slack)
+   CloudWatch → Log Metrics
+   S3 → Apply Lifecycle Policies
+```
+
+### Target Platforms
+
+The system synchronizes bottles for the three most recent macOS versions:
+
+- **`arm64_sonoma`** - macOS Sonoma (14.x) on Apple Silicon
+- **`arm64_ventura`** - macOS Ventura (13.x) on Apple Silicon  
+- **`monterey`** - macOS Monterey (12.x) on Intel/Apple Silicon
+
+### Key Design Principles
+
+1. **Intelligent Routing**: Automatic selection between Lambda and ECS based on workload size
+2. **Duplicate Prevention**: SHA256-based tracking prevents redundant downloads
+3. **Fault Tolerance**: Retry logic, graceful degradation, and error recovery
+4. **Cost Optimization**: Lifecycle policies, spot instances, and efficient resource allocation
+5. **Observability**: Comprehensive logging, metrics, and real-time notifications
+6. **Security**: Least privilege IAM, encrypted storage, and secure communications
+7. **Scalability**: Auto-scaling ECS tasks and concurrent Lambda executions
 
 ## Quick Start
 
