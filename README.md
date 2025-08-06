@@ -95,124 +95,116 @@ graph TB
 ### AWS Infrastructure Deployment (Terraform)
 
 ```mermaid
-graph TB
-    %% AWS Account & Region
-    AWS[AWS Account us-east-1]
+graph TD
+    %% External Sources (Top Level)
+    EXTERNAL[External Sources]
+    HOMEBREW[Homebrew API<br/>formulae.brew.sh]
+    EXT_HASH[External Hash Sources<br/>S3 + HTTPS URLs]
     
-    %% VPC & Networking
-    subgraph VPC["VPC Network 10.0.0.0/16"]
-        subgraph AZ1["Availability Zone 1a"]
-            PUB1[Public Subnet<br/>10.0.1.0/24]
-            PRIV1[Private Subnet<br/>10.0.10.0/24]
-        end
-        
-        subgraph AZ2["Availability Zone 1b"]
-            PUB2[Public Subnet<br/>10.0.2.0/24]
-            PRIV2[Private Subnet<br/>10.0.20.0/24]
-        end
-        
-        IGW[Internet Gateway]
-        NAT1[NAT Gateway 1]
-        NAT2[NAT Gateway 2]
-    end
+    %% Scheduling Layer
+    EVENTS[Scheduling & Events]
+    EB_RULE[EventBridge Rule<br/>Weekly Sunday 3AM UTC]
+    EB_DLQ[EventBridge DLQ<br/>Failed invocations]
     
-    %% Compute Services
-    subgraph COMPUTE["Compute Services"]
-        ORCH_L[Lambda Orchestrator<br/>512MB - 5min timeout]
-        SYNC_L[Lambda Sync Worker<br/>3GB - 15min timeout]
-        LAYER[Shared Dependencies Layer]
-        
-        CLUSTER[ECS Fargate Cluster<br/>Container Insights]
-        TASK_DEF[ECS Task Definition<br/>2 vCPU - 8GB RAM]
-    end
+    %% Compute Layer
+    COMPUTE[Compute Services]
+    ORCH_L[Lambda Orchestrator<br/>512MB - 5min timeout]
+    SYNC_L[Lambda Sync Worker<br/>3GB - 15min timeout]
+    LAYER[Shared Dependencies Layer]
+    CLUSTER[ECS Fargate Cluster<br/>Container Insights]
+    TASK_DEF[ECS Task Definition<br/>2 vCPU - 8GB RAM]
     
-    %% Storage Services
-    subgraph STORAGE["Storage Services"]
-        S3_MAIN[S3 Main Bucket<br/>Versioning + Encryption<br/>Lifecycle Policies]
-        S3_LOGS[S3 Access Logs Bucket]
-        EFS_FS[EFS File System<br/>Encrypted + IA Transition]
-        EFS_AP[EFS Access Point<br/>POSIX 1000:1000]
-    end
+    %% Network Layer
+    NETWORK[Network Infrastructure]
+    VPC[VPC Network<br/>10.0.0.0/16]
+    IGW[Internet Gateway]
+    PUB_SUBNETS[Public Subnets<br/>10.0.1.0/24, 10.0.2.0/24<br/>NAT Gateways]
+    PRIV_SUBNETS[Private Subnets<br/>10.0.10.0/24, 10.0.20.0/24<br/>ECS Tasks]
     
-    %% Security & Access
-    subgraph SECURITY["Security & Access"]
-        LAMBDA_EXEC[Lambda Execution Role]
-        LAMBDA_ORCH[Lambda Orchestrator Role]
-        LAMBDA_SYNC[Lambda Sync Role]
-        ECS_EXEC[ECS Task Execution Role]
-        ECS_TASK[ECS Task Role]
-        
-        ECS_SG[ECS Security Group<br/>Outbound 80,443,2049]
-        EFS_SG[EFS Security Group<br/>Inbound 2049]
-        
-        SECRETS[Secrets Manager<br/>Slack Webhook + KMS]
-    end
+    %% Storage Layer
+    STORAGE[Storage Services]
+    S3_MAIN[S3 Main Bucket<br/>Versioning + Encryption<br/>Lifecycle Policies]
+    S3_LOGS[S3 Access Logs Bucket]
+    EFS_FS[EFS File System<br/>Encrypted + IA Transition]
+    EFS_AP[EFS Access Point<br/>POSIX 1000:1000]
     
-    %% Monitoring & Logging
-    subgraph MONITORING["Monitoring & Logging"]
-        CW_LOGS[CloudWatch Log Groups<br/>14 days retention]
-        CW_METRICS[Custom Metrics<br/>Sync stats + costs]
-        CW_ALARMS[CloudWatch Alarms<br/>Errors + thresholds]
-        CW_DASHBOARD[CloudWatch Dashboard]
-        SNS_TOPIC[SNS Topic<br/>Email notifications]
-    end
+    %% Security Layer
+    SECURITY[Security & Access]
+    IAM_ROLES[IAM Roles<br/>Lambda + ECS Execution<br/>Task Roles with S3/EFS Access]
+    SECURITY_GROUPS[Security Groups<br/>ECS Outbound 80,443,2049<br/>EFS Inbound 2049]
+    SECRETS[Secrets Manager<br/>Slack Webhook + KMS]
     
-    %% Scheduling & Events
-    subgraph EVENTS["Scheduling & Events"]
-        EB_RULE[EventBridge Rule<br/>Weekly Sunday 3AM UTC]
-        EB_DLQ[EventBridge DLQ<br/>Failed invocations]
-    end
+    %% Monitoring Layer
+    MONITORING[Monitoring & Logging]
+    CW_LOGS[CloudWatch Log Groups<br/>14 days retention]
+    CW_METRICS[Custom Metrics<br/>Sync stats + costs]
+    CW_ALARMS[CloudWatch Alarms<br/>Errors + thresholds]
+    CW_DASHBOARD[CloudWatch Dashboard]
+    SNS_TOPIC[SNS Topic<br/>Email notifications]
     
-    %% External Integrations
-    subgraph EXTERNAL["External Integrations"]
-        HOMEBREW[Homebrew API<br/>formulae.brew.sh]
-        SLACK_WH[Slack Webhook<br/>Rich notifications]
-        EXT_HASH[External Hash Sources<br/>S3 + HTTPS URLs]
-    end
+    %% Notification Layer
+    NOTIFICATIONS[Notifications]
+    SLACK_WH[Slack Webhook<br/>Rich notifications]
     
-    %% Network Connections
-    AWS --> VPC
-    IGW --> PUB1
-    IGW --> PUB2
-    PUB1 --> NAT1
-    PUB2 --> NAT2
-    NAT1 --> PRIV1
-    NAT2 --> PRIV2
+    %% Flow Connections (Top to Bottom)
+    EXTERNAL --> HOMEBREW
+    EXTERNAL --> EXT_HASH
     
-    %% Compute Connections
+    EVENTS --> EB_RULE
+    EVENTS --> EB_DLQ
+    EB_RULE --> ORCH_L
+    
+    COMPUTE --> ORCH_L
+    COMPUTE --> SYNC_L
+    COMPUTE --> LAYER
+    COMPUTE --> CLUSTER
+    COMPUTE --> TASK_DEF
+    
     ORCH_L -.-> LAYER
     SYNC_L -.-> LAYER
     TASK_DEF --> CLUSTER
     
-    %% Storage Connections
+    NETWORK --> VPC
+    NETWORK --> IGW
+    NETWORK --> PUB_SUBNETS
+    NETWORK --> PRIV_SUBNETS
+    
+    IGW --> PUB_SUBNETS
+    PUB_SUBNETS --> PRIV_SUBNETS
+    
+    STORAGE --> S3_MAIN
+    STORAGE --> S3_LOGS
+    STORAGE --> EFS_FS
+    STORAGE --> EFS_AP
+    
     S3_MAIN --> S3_LOGS
     EFS_FS --> EFS_AP
-    EFS_AP --> PRIV1
-    EFS_AP --> PRIV2
+    EFS_AP --> PRIV_SUBNETS
     
-    %% Security Connections
-    LAMBDA_ORCH --> LAMBDA_EXEC
-    LAMBDA_SYNC --> LAMBDA_EXEC
-    ECS_TASK --> ECS_EXEC
-    ECS_SG --> PRIV1
-    ECS_SG --> PRIV2
-    EFS_SG --> EFS_FS
+    SECURITY --> IAM_ROLES
+    SECURITY --> SECURITY_GROUPS
+    SECURITY --> SECRETS
     
-    %% Monitoring Connections
+    IAM_ROLES --> ORCH_L
+    IAM_ROLES --> SYNC_L
+    IAM_ROLES --> TASK_DEF
+    SECURITY_GROUPS --> PRIV_SUBNETS
+    
+    MONITORING --> CW_LOGS
+    MONITORING --> CW_METRICS
+    MONITORING --> CW_ALARMS
+    MONITORING --> CW_DASHBOARD
+    MONITORING --> SNS_TOPIC
+    
     CW_ALARMS --> SNS_TOPIC
     CW_METRICS --> CW_DASHBOARD
     
-    %% Event Connections
-    EB_RULE --> ORCH_L
-    EB_RULE --> EB_DLQ
-    
-    %% External Connections
-    ORCH_L --> HOMEBREW
-    ORCH_L --> EXT_HASH
-    SYNC_L --> SLACK_WH
-    TASK_DEF --> SLACK_WH
+    NOTIFICATIONS --> SLACK_WH
     
     %% Data Flow Connections
+    HOMEBREW --> ORCH_L
+    EXT_HASH --> ORCH_L
+    
     ORCH_L --> S3_MAIN
     SYNC_L --> S3_MAIN
     TASK_DEF --> S3_MAIN
@@ -226,22 +218,27 @@ graph TB
     SYNC_L --> CW_LOGS
     TASK_DEF --> CW_LOGS
     
+    SYNC_L --> SLACK_WH
+    TASK_DEF --> SLACK_WH
+    
     %% Styling
-    classDef vpc fill:#e3f2fd
+    classDef external fill:#e1f5fe
+    classDef events fill:#f1f8e9
     classDef compute fill:#f3e5f5
+    classDef network fill:#e3f2fd
     classDef storage fill:#e8f5e8
     classDef security fill:#ffebee
     classDef monitoring fill:#fff3e0
-    classDef events fill:#f1f8e9
-    classDef external fill:#fce4ec
+    classDef notifications fill:#fce4ec
     
-    class VPC,AZ1,AZ2,PUB1,PUB2,PRIV1,PRIV2,IGW,NAT1,NAT2 vpc
-    class COMPUTE,ORCH_L,SYNC_L,LAYER,CLUSTER,TASK_DEF compute
-    class STORAGE,S3_MAIN,S3_LOGS,EFS_FS,EFS_AP storage
-    class SECURITY,LAMBDA_EXEC,LAMBDA_ORCH,LAMBDA_SYNC,ECS_EXEC,ECS_TASK,ECS_SG,EFS_SG,SECRETS security
-    class MONITORING,CW_LOGS,CW_METRICS,CW_ALARMS,CW_DASHBOARD,SNS_TOPIC monitoring
+    class EXTERNAL,HOMEBREW,EXT_HASH external
     class EVENTS,EB_RULE,EB_DLQ events
-    class EXTERNAL,HOMEBREW,SLACK_WH,EXT_HASH external
+    class COMPUTE,ORCH_L,SYNC_L,LAYER,CLUSTER,TASK_DEF compute
+    class NETWORK,VPC,IGW,PUB_SUBNETS,PRIV_SUBNETS network
+    class STORAGE,S3_MAIN,S3_LOGS,EFS_FS,EFS_AP storage
+    class SECURITY,IAM_ROLES,SECURITY_GROUPS,SECRETS security
+    class MONITORING,CW_LOGS,CW_METRICS,CW_ALARMS,CW_DASHBOARD,SNS_TOPIC monitoring
+    class NOTIFICATIONS,SLACK_WH notifications
 ```
 
 ### Detailed Component Architecture
