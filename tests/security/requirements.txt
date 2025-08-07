@@ -1,0 +1,12 @@
+# Security testing dependencies
+pytest>=7.0.0
+safety>=2.3.0
+pip-audit>=2.6.0
+checkov>=2.4.0
+bandit>=1.7.0
+semgrep>=1.45.0
+
+# Additional security analysis tools
+requests>=2.28.0
+pyyaml>=6.0
+jsonschema>=4.17.0

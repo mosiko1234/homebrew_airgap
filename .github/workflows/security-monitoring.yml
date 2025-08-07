@@ -1,0 +1,500 @@
+name: Security Monitoring
+
+on:
+  schedule:
+    # Run every hour
+    - cron: '0 * * * *'
+  workflow_dispatch:
+    inputs:
+      hours_back:
+        description: 'Hours of history to analyze'
+        required: false
+        default: '1'
+        type: string
+      environment:
+        description: 'Environment to monitor'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+        - all
+        - dev
+        - staging
+        - prod
+      severity_threshold:
+        description: 'Minimum severity to alert on'
+        required: false
+        default: 'MEDIUM'
+        type: choice
+        options:
+        - LOW
+        - MEDIUM
+        - HIGH
+        - CRITICAL
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  security-monitoring:
+    name: Security Monitoring
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ 
+            matrix.environment == 'dev' && secrets.AWS_ROLE_ARN_DEV ||
+            matrix.environment == 'staging' && secrets.AWS_ROLE_ARN_STAGING ||
+            matrix.environment == 'prod' && secrets.AWS_ROLE_ARN_PROD
+          }}
+          role-session-name: SecurityMonitoring-${{ matrix.environment }}
+          aws-region: ${{ 
+            matrix.environment == 'dev' && 'us-west-2' || 'us-east-1'
+          }}
+
+      - name: Run security monitoring
+        id: monitoring
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+        run: |
+          hours_back="${{ github.event.inputs.hours_back || '1' }}"
+          environment="${{ github.event.inputs.environment || matrix.environment }}"
+          
+          # Skip if environment filter doesn't match
+          if [[ "${{ github.event.inputs.environment }}" != "all" && "${{ github.event.inputs.environment }}" != "$environment" ]]; then
+            echo "Skipping $environment due to environment filter"
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "Running security monitoring for $environment environment"
+          
+          # Run security monitoring
+          python scripts/security-monitor.py \
+            --region ${{ matrix.environment == 'dev' && 'us-west-2' || 'us-east-1' }} \
+            --environment $environment \
+            --hours-back $hours_back \
+            --output security-results-$environment.json \
+            --verbose
+          
+          # Check if any alerts were generated
+          alert_count=$(cat security-results-$environment.json | jq '.alerts_generated')
+          critical_count=$(cat security-results-$environment.json | jq '[.alerts[] | select(.severity == "CRITICAL")] | length')
+          high_count=$(cat security-results-$environment.json | jq '[.alerts[] | select(.severity == "HIGH")] | length')
+          
+          echo "alert_count=$alert_count" >> $GITHUB_OUTPUT
+          echo "critical_count=$critical_count" >> $GITHUB_OUTPUT
+          echo "high_count=$high_count" >> $GITHUB_OUTPUT
+          
+          # Set job status based on severity threshold
+          threshold="${{ github.event.inputs.severity_threshold || 'MEDIUM' }}"
+          
+          if [[ $critical_count -gt 0 && "$threshold" != "CRITICAL" ]]; then
+            echo "status=critical" >> $GITHUB_OUTPUT
+          elif [[ $high_count -gt 0 && "$threshold" != "HIGH" && "$threshold" != "CRITICAL" ]]; then
+            echo "status=high" >> $GITHUB_OUTPUT
+          elif [[ $alert_count -gt 0 ]]; then
+            echo "status=alerts" >> $GITHUB_OUTPUT
+          else
+            echo "status=clean" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload security results and reports
+        if: steps.monitoring.outputs.skipped != 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-results-${{ matrix.environment }}
+          path: |
+            security-results-${{ matrix.environment }}.json
+            incident-report-${{ matrix.environment }}.md
+
+      - name: Process security alerts with alert manager
+        if: steps.monitoring.outputs.alert_count > 0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          NOTIFICATION_EMAIL: ${{ secrets.NOTIFICATION_EMAIL }}
+        run: |
+          # Process each alert through the alert management system
+          echo "Processing security alerts through alert manager..."
+          
+          # Extract alerts from monitoring results
+          cat security-results-${{ matrix.environment }}.json | jq -c '.alerts[]' | while read alert; do
+            # Create temporary alert file
+            echo "$alert" > temp-alert.json
+            
+            # Process alert through alert manager
+            python scripts/security-alert-manager.py \
+              --region ${{ matrix.environment == 'dev' && 'us-west-2' || 'us-east-1' }} \
+              --environment ${{ matrix.environment }} \
+              --action process-alert \
+              --alert-file temp-alert.json \
+              --output alert-processing-result.json
+            
+            # Log processing result
+            echo "Alert processing result:"
+            cat alert-processing-result.json
+            
+            # Clean up temp file
+            rm -f temp-alert.json
+          done
+          
+          # Generate incident report
+          python scripts/security-alert-manager.py \
+            --region ${{ matrix.environment == 'dev' && 'us-west-2' || 'us-east-1' }} \
+            --environment ${{ matrix.environment }} \
+            --action incident-report \
+            --days-back 7 \
+            --output incident-report-${{ matrix.environment }}.md
+
+      - name: Create security issue for critical alerts
+        if: steps.monitoring.outputs.critical_count > 0
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const results = JSON.parse(fs.readFileSync('security-results-${{ matrix.environment }}.json', 'utf8'));
+            
+            const criticalAlerts = results.alerts.filter(alert => alert.severity === 'CRITICAL');
+            
+            let issueBody = `# 🚨 Critical Security Alerts Detected\n\n`;
+            issueBody += `**Environment:** ${{ matrix.environment }}\n`;
+            issueBody += `**Monitoring Period:** ${results.monitoring_period.start_time} to ${results.monitoring_period.end_time}\n`;
+            issueBody += `**Critical Alerts:** ${criticalAlerts.length}\n`;
+            issueBody += `**Access Attempts Logged:** ${results.access_attempts_logged || 0}\n`;
+            issueBody += `**Compliance Status:** ${results.compliance_report?.overall_status || 'Unknown'}\n\n`;
+            
+            issueBody += `## 🔍 Security Monitoring Features Active\n\n`;
+            issueBody += `✅ **Access Logging:** All access attempts logged for audit trail\n`;
+            issueBody += `✅ **Suspicious Activity Detection:** Advanced pattern detection active\n`;
+            issueBody += `✅ **IAM Compliance Checking:** Automated compliance validation\n`;
+            issueBody += `✅ **Automated Incident Creation:** Security incidents automatically created\n`;
+            issueBody += `✅ **Real-time Alerting:** Immediate notifications sent to security team\n\n`;
+            
+            criticalAlerts.forEach((alert, index) => {
+              issueBody += `## Alert ${index + 1}: ${alert.title}\n\n`;
+              issueBody += `**Severity:** ${alert.severity}\n`;
+              issueBody += `**Description:** ${alert.description}\n`;
+              issueBody += `**Alert ID:** ${alert.alert_id}\n`;
+              issueBody += `**Events:** ${alert.events.length}\n`;
+              issueBody += `**Risk Score:** ${alert.events.length > 0 ? alert.events[0].risk_score || 'N/A' : 'N/A'}\n\n`;
+              
+              if (alert.recommended_actions.length > 0) {
+                issueBody += `**Recommended Actions:**\n`;
+                alert.recommended_actions.forEach(action => {
+                  issueBody += `- ${action}\n`;
+                });
+                issueBody += `\n`;
+              }
+              
+              // Add event details for critical alerts
+              if (alert.events.length > 0) {
+                issueBody += `**Event Details:**\n`;
+                alert.events.slice(0, 3).forEach((event, eventIndex) => {
+                  issueBody += `${eventIndex + 1}. **${event.event_name || 'Unknown Event'}**\n`;
+                  issueBody += `   - Source IP: ${event.source_ip || 'Unknown'}\n`;
+                  issueBody += `   - User: ${event.user_identity || 'Unknown'}\n`;
+                  issueBody += `   - Time: ${event.timestamp || 'Unknown'}\n`;
+                  if (event.risk_score) {
+                    issueBody += `   - Risk Score: ${event.risk_score}/100\n`;
+                  }
+                });
+                if (alert.events.length > 3) {
+                  issueBody += `   ... and ${alert.events.length - 3} more events\n`;
+                }
+                issueBody += `\n`;
+              }
+            });
+            
+            issueBody += `## 🚨 Immediate Actions Required\n\n`;
+            issueBody += `1. **URGENT:** Review all critical alerts immediately\n`;
+            issueBody += `2. **INVESTIGATE:** Check for potential security breaches\n`;
+            issueBody += `3. **RESPOND:** Take recommended actions to mitigate risks\n`;
+            issueBody += `4. **MONITOR:** Watch for escalation or additional suspicious activity\n`;
+            issueBody += `5. **DOCUMENT:** Update incident records with actions taken\n\n`;
+            
+            issueBody += `## 📊 Additional Resources\n\n`;
+            issueBody += `- **Full Results:** Check the security-results-${{ matrix.environment }} artifact\n`;
+            issueBody += `- **Incident Report:** Check the incident-report-${{ matrix.environment }} artifact\n`;
+            issueBody += `- **Access Logs:** Review CloudWatch logs in /aws/security-access-logs/${{ matrix.environment }}\n`;
+            issueBody += `- **Security Incidents:** Review CloudWatch logs in /aws/security-incidents/${{ matrix.environment }}\n\n`;
+            
+            issueBody += `---\n`;
+            issueBody += `*This alert was generated by the automated security monitoring system with comprehensive access logging, suspicious activity detection, and compliance checking as required by security requirements.*`;
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚨 Critical Security Alerts - ${{ matrix.environment }} Environment`,
+              body: issueBody,
+              labels: ['security', 'critical', 'urgent', '${{ matrix.environment }}', 'automated-security-monitoring']
+            });
+            
+            console.log(`Created critical security issue #${issue.data.number}`);
+
+      - name: Fail job on critical alerts
+        if: steps.monitoring.outputs.status == 'critical'
+        run: |
+          echo "❌ Critical security alerts detected in ${{ matrix.environment }} environment"
+          echo "Review the security results and take immediate action"
+          exit 1
+
+      - name: Warning on high alerts
+        if: steps.monitoring.outputs.status == 'high'
+        run: |
+          echo "⚠️ High severity security alerts detected in ${{ matrix.environment }} environment"
+          echo "Review the security results and take appropriate action"
+
+  compliance-check:
+    name: Compliance Check
+    runs-on: ubuntu-latest
+    needs: security-monitoring
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install boto3 requests
+
+      - name: Download security results
+        uses: actions/download-artifact@v3
+        with:
+          path: security-results
+
+      - name: Generate comprehensive compliance report
+        env:
+          AWS_REGION: us-east-1
+        run: |
+          # Generate executive security report
+          python scripts/security-reporter.py \
+            --region $AWS_REGION \
+            --environment all \
+            --days-back 7 \
+            --report-type executive \
+            --format markdown \
+            --output executive-security-report.md
+          
+          # Generate detailed compliance report
+          python scripts/security-reporter.py \
+            --region $AWS_REGION \
+            --environment all \
+            --days-back 7 \
+            --report-type compliance \
+            --format json \
+            --output compliance-details.json
+          
+          # Create combined compliance report
+          echo "# Security Compliance Report" > compliance-report.md
+          echo "" >> compliance-report.md
+          echo "**Generated:** $(date -u)" >> compliance-report.md
+          echo "**Repository:** ${{ github.repository }}" >> compliance-report.md
+          echo "" >> compliance-report.md
+          
+          # Add executive summary
+          echo "## Executive Summary" >> compliance-report.md
+          echo "" >> compliance-report.md
+          cat executive-security-report.md >> compliance-report.md
+          echo "" >> compliance-report.md
+          
+          # Add environment-specific details
+          total_alerts=0
+          critical_alerts=0
+          high_alerts=0
+          
+          for env in dev staging prod; do
+            if [[ -f "security-results/security-results-$env/security-results-$env.json" ]]; then
+              echo "## $env Environment Details" >> compliance-report.md
+              echo "" >> compliance-report.md
+              
+              alerts=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '.alerts_generated')
+              critical=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '[.alerts[] | select(.severity == "CRITICAL")] | length')
+              high=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '[.alerts[] | select(.severity == "HIGH")] | length')
+              medium=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '[.alerts[] | select(.severity == "MEDIUM")] | length')
+              low=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '[.alerts[] | select(.severity == "LOW")] | length')
+              
+              echo "- **Total Alerts:** $alerts" >> compliance-report.md
+              echo "- **Critical:** $critical" >> compliance-report.md
+              echo "- **High:** $high" >> compliance-report.md
+              echo "- **Medium:** $medium" >> compliance-report.md
+              echo "- **Low:** $low" >> compliance-report.md
+              
+              # Add access logging summary
+              access_logged=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '.access_attempts_logged // 0')
+              echo "- **Access Attempts Logged:** $access_logged" >> compliance-report.md
+              
+              # Add compliance report summary
+              if [[ -f "security-results/security-results-$env/security-results-$env.json" ]]; then
+                compliance_status=$(cat "security-results/security-results-$env/security-results-$env.json" | jq -r '.compliance_report.overall_status // "UNKNOWN"')
+                echo "- **Compliance Status:** $compliance_status" >> compliance-report.md
+              fi
+              
+              echo "" >> compliance-report.md
+              
+              total_alerts=$((total_alerts + alerts))
+              critical_alerts=$((critical_alerts + critical))
+              high_alerts=$((high_alerts + high))
+            else
+              echo "## $env Environment Details" >> compliance-report.md
+              echo "" >> compliance-report.md
+              echo "- **Status:** No monitoring data available" >> compliance-report.md
+              echo "" >> compliance-report.md
+            fi
+          done
+          
+          echo "## Overall Security Summary" >> compliance-report.md
+          echo "" >> compliance-report.md
+          echo "- **Total Alerts Across All Environments:** $total_alerts" >> compliance-report.md
+          echo "- **Critical Alerts:** $critical_alerts" >> compliance-report.md
+          echo "- **High Severity Alerts:** $high_alerts" >> compliance-report.md
+          echo "" >> compliance-report.md
+          
+          if [[ $critical_alerts -gt 0 ]]; then
+            echo "## ❌ Overall Compliance Status: FAILED" >> compliance-report.md
+            echo "" >> compliance-report.md
+            echo "**IMMEDIATE ACTION REQUIRED:** Critical security alerts detected that require immediate attention." >> compliance-report.md
+            echo "" >> compliance-report.md
+            echo "### Critical Issues to Address:" >> compliance-report.md
+            echo "1. Review all critical alerts in environment-specific results" >> compliance-report.md
+            echo "2. Investigate potential security breaches" >> compliance-report.md
+            echo "3. Implement recommended security measures immediately" >> compliance-report.md
+            echo "4. Consider temporary access restrictions if needed" >> compliance-report.md
+          elif [[ $high_alerts -gt 0 ]]; then
+            echo "## ⚠️ Overall Compliance Status: WARNING" >> compliance-report.md
+            echo "" >> compliance-report.md
+            echo "**ACTION REQUIRED:** High severity alerts should be addressed promptly." >> compliance-report.md
+            echo "" >> compliance-report.md
+            echo "### High Priority Issues:" >> compliance-report.md
+            echo "1. Review all high severity alerts" >> compliance-report.md
+            echo "2. Implement recommended security improvements" >> compliance-report.md
+            echo "3. Monitor for escalation of issues" >> compliance-report.md
+          else
+            echo "## ✅ Overall Compliance Status: PASSED" >> compliance-report.md
+            echo "" >> compliance-report.md
+            echo "No critical or high severity security alerts detected. Continue monitoring." >> compliance-report.md
+          fi
+          
+          echo "" >> compliance-report.md
+          echo "## Security Monitoring Features Active" >> compliance-report.md
+          echo "" >> compliance-report.md
+          echo "✅ **Access Logging:** All access attempts are logged for audit trail" >> compliance-report.md
+          echo "✅ **Suspicious Activity Detection:** Advanced pattern detection for unauthorized access" >> compliance-report.md
+          echo "✅ **IAM Compliance Checking:** Automated compliance validation" >> compliance-report.md
+          echo "✅ **Real-time Alerting:** Immediate notifications for security events" >> compliance-report.md
+          echo "✅ **Compliance Reporting:** Regular compliance status reports" >> compliance-report.md
+          echo "" >> compliance-report.md
+          
+          echo "## Recommendations" >> compliance-report.md
+          echo "" >> compliance-report.md
+          echo "1. **Immediate:** Address all critical and high severity alerts" >> compliance-report.md
+          echo "2. **Short-term:** Implement recommended security measures from alerts" >> compliance-report.md
+          echo "3. **Ongoing:** Monitor security trends and adjust policies as needed" >> compliance-report.md
+          echo "4. **Regular:** Conduct security training for team members" >> compliance-report.md
+          echo "5. **Quarterly:** Review and update security policies and procedures" >> compliance-report.md
+          echo "" >> compliance-report.md
+          
+          echo "---" >> compliance-report.md
+          echo "*This report includes comprehensive security monitoring with access logging, suspicious activity detection, and compliance checking as required by security policy 5.5*" >> compliance-report.md
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v3
+        with:
+          name: compliance-report
+          path: compliance-report.md
+
+      - name: Send compliance summary
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [[ -z "$SLACK_WEBHOOK_URL" ]]; then
+            echo "No Slack webhook configured, skipping notification"
+            exit 0
+          fi
+          
+          # Count total alerts
+          total_alerts=0
+          critical_alerts=0
+          
+          for env in dev staging prod; do
+            if [[ -f "security-results/security-results-$env/security-results-$env.json" ]]; then
+              alerts=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '.alerts_generated')
+              critical=$(cat "security-results/security-results-$env/security-results-$env.json" | jq '[.alerts[] | select(.severity == "CRITICAL")] | length')
+              total_alerts=$((total_alerts + alerts))
+              critical_alerts=$((critical_alerts + critical))
+            fi
+          done
+          
+          # Determine status and color
+          if [[ $critical_alerts -gt 0 ]]; then
+            status="❌ FAILED"
+            color="danger"
+          elif [[ $total_alerts -gt 0 ]]; then
+            status="⚠️ WARNING"
+            color="warning"
+          else
+            status="✅ PASSED"
+            color="good"
+          fi
+          
+          # Send Slack notification
+          curl -X POST -H 'Content-type: application/json' \
+            --data "{
+              \"text\": \"Security Compliance Report\",
+              \"attachments\": [
+                {
+                  \"color\": \"$color\",
+                  \"title\": \"Security Monitoring Summary\",
+                  \"fields\": [
+                    {
+                      \"title\": \"Status\",
+                      \"value\": \"$status\",
+                      \"short\": true
+                    },
+                    {
+                      \"title\": \"Total Alerts\",
+                      \"value\": \"$total_alerts\",
+                      \"short\": true
+                    },
+                    {
+                      \"title\": \"Critical Alerts\",
+                      \"value\": \"$critical_alerts\",
+                      \"short\": true
+                    },
+                    {
+                      \"title\": \"Repository\",
+                      \"value\": \"${{ github.repository }}\",
+                      \"short\": true
+                    }
+                  ],
+                  \"footer\": \"Security Monitoring\",
+                  \"ts\": $(date +%s)
+                }
+              ]
+            }" \
+            "$SLACK_WEBHOOK_URL"

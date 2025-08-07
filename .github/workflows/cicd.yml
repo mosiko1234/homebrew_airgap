@@ -1,0 +1,616 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - prod
+      skip_tests:
+        description: 'Skip tests (emergency deployment)'
+        required: false
+        default: false
+        type: boolean
+      force_deploy:
+        description: 'Force deployment even if no changes detected'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  PYTHON_VERSION: '3.11'
+  TERRAFORM_VERSION: '1.5.0'
+  # Performance optimization flags
+  CACHE_VERSION: 'v2'  # Increment to bust caches
+  PARALLEL_JOBS: '4'   # Number of parallel test jobs
+
+jobs:
+  # Change detection and validation stage - optimized with caching
+  detect-changes:
+    name: Detect Changes and Validate
+    runs-on: ubuntu-latest
+    outputs:
+      config-changed: ${{ steps.changes.outputs.config }}
+      terraform-changed: ${{ steps.changes.outputs.terraform }}
+      code-changed: ${{ steps.changes.outputs.code }}
+      docs-changed: ${{ steps.changes.outputs.docs }}
+      tests-changed: ${{ steps.changes.outputs.tests }}
+      should-deploy: ${{ steps.deployment-decision.outputs.should-deploy }}
+      target-environments: ${{ steps.deployment-decision.outputs.environments }}
+      cache-key: ${{ steps.cache-keys.outputs.validation }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate cache keys
+        id: cache-keys
+        run: |
+          # Create composite cache key for validation dependencies
+          VALIDATION_KEY="${{ env.CACHE_VERSION }}-validation-${{ runner.os }}-${{ hashFiles('requirements.txt', 'scripts/config_processor.py', 'terraform/**/*.tf') }}"
+          echo "validation=$VALIDATION_KEY" >> $GITHUB_OUTPUT
+          
+          # Create cache key for Python dependencies
+          PYTHON_KEY="${{ env.CACHE_VERSION }}-python-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('requirements.txt') }}"
+          echo "python=$PYTHON_KEY" >> $GITHUB_OUTPUT
+
+      - name: Detect changes with enhanced filters
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            config:
+              - 'config.yaml'
+              - 'scripts/config_processor.py'
+              - 'config/**'
+            terraform:
+              - 'terraform/**/*.tf'
+              - 'terraform/**/*.tfvars'
+              - 'terraform/**/*.hcl'
+            code:
+              - 'lambda/**'
+              - 'ecs/**'
+              - 'shared/**'
+            docs:
+              - '*.md'
+              - 'docs/**'
+            tests:
+              - 'tests/**'
+              - 'pytest.ini'
+              - 'conftest.py'
+
+      - name: Set up Python with caching
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          cache-dependency-path: 'requirements.txt'
+
+      - name: Cache validation dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.terraform.d/plugin-cache
+          key: ${{ steps.cache-keys.outputs.validation }}
+          restore-keys: |
+            ${{ env.CACHE_VERSION }}-validation-${{ runner.os }}-
+
+      - name: Install dependencies (optimized)
+        run: |
+          python -m pip install --upgrade pip
+          # Only install what we need for validation
+          pip install pyyaml jsonschema terraform-compliance
+
+      - name: Validate configuration (parallel)
+        run: |
+          # Run configuration validation in background
+          python scripts/config_processor.py --validate &
+          CONFIG_PID=$!
+          
+          # Run secrets validation in parallel
+          python scripts/validate-secrets.py -r ${{ github.repository }} --json > secrets-validation.json &
+          SECRETS_PID=$!
+          
+          # Wait for both to complete
+          wait $CONFIG_PID
+          CONFIG_RESULT=$?
+          
+          wait $SECRETS_PID
+          SECRETS_RESULT=$?
+          
+          # Check results
+          if [ $CONFIG_RESULT -ne 0 ]; then
+            echo "❌ Configuration validation failed"
+            exit 1
+          fi
+          
+          if [ $SECRETS_RESULT -ne 0 ]; then
+            echo "❌ Secrets validation failed"
+            cat secrets-validation.json
+            exit 1
+          fi
+          
+          echo "✅ All validations passed"
+
+      - name: Set up Terraform with caching
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.terraform.d/plugin-cache
+            terraform/.terraform
+          key: ${{ env.CACHE_VERSION }}-terraform-${{ runner.os }}-${{ env.TERRAFORM_VERSION }}-${{ hashFiles('terraform/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ env.CACHE_VERSION }}-terraform-${{ runner.os }}-${{ env.TERRAFORM_VERSION }}-
+
+      - name: Terraform validation (optimized)
+        if: steps.changes.outputs.terraform == 'true' || github.event.inputs.force_deploy == 'true'
+        run: |
+          cd terraform
+          
+          # Parallel format check and validation
+          terraform fmt -check -recursive . &
+          FORMAT_PID=$!
+          
+          # Initialize with plugin cache
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          mkdir -p $TF_PLUGIN_CACHE_DIR
+          terraform init -backend=false &
+          INIT_PID=$!
+          
+          # Wait for format check
+          wait $FORMAT_PID
+          if [ $? -ne 0 ]; then
+            echo "❌ Terraform format check failed"
+            exit 1
+          fi
+          
+          # Wait for init and then validate
+          wait $INIT_PID
+          terraform validate
+
+      - name: Security scan (conditional)
+        if: steps.changes.outputs.terraform == 'true' || steps.changes.outputs.code == 'true' || github.event.inputs.force_deploy == 'true'
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'terraform/'
+          format: 'sarif'
+          output: 'trivy-terraform.sarif'
+
+      - name: Upload security scan results
+        if: always() && (steps.changes.outputs.terraform == 'true' || steps.changes.outputs.code == 'true' || github.event.inputs.force_deploy == 'true')
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-terraform.sarif'
+
+      - name: Determine deployment strategy
+        id: deployment-decision
+        run: |
+          # Determine if we should deploy based on changes and trigger
+          SHOULD_DEPLOY="false"
+          ENVIRONMENTS="[]"
+          
+          # Force deploy if requested
+          if [ "${{ github.event.inputs.force_deploy }}" == "true" ]; then
+            SHOULD_DEPLOY="true"
+            ENVIRONMENTS='["${{ github.event.inputs.environment }}"]'
+          # Deploy on code/config/terraform changes
+          elif [ "${{ steps.changes.outputs.code }}" == "true" ] || \
+               [ "${{ steps.changes.outputs.config }}" == "true" ] || \
+               [ "${{ steps.changes.outputs.terraform }}" == "true" ]; then
+            SHOULD_DEPLOY="true"
+            
+            # Determine target environments based on branch/event
+            if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+              ENVIRONMENTS='["${{ github.event.inputs.environment }}"]'
+            elif [ "${{ github.ref }}" == "refs/heads/develop" ]; then
+              ENVIRONMENTS='["dev"]'
+            elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
+              ENVIRONMENTS='["staging"]'
+            elif [ "${{ github.event_name }}" == "release" ]; then
+              ENVIRONMENTS='["prod"]'
+            fi
+          fi
+          
+          echo "should-deploy=$SHOULD_DEPLOY" >> $GITHUB_OUTPUT
+          echo "environments=$ENVIRONMENTS" >> $GITHUB_OUTPUT
+          
+          echo "🎯 Deployment decision: $SHOULD_DEPLOY"
+          echo "🌍 Target environments: $ENVIRONMENTS"
+
+  # Parallel testing stages - optimized execution
+  code-quality:
+    name: Code Quality Checks
+    uses: ./.github/workflows/code-quality.yml
+    needs: detect-changes
+    if: success() && (needs.detect-changes.outputs.code-changed == 'true' || needs.detect-changes.outputs.terraform-changed == 'true' || github.event.inputs.force_deploy == 'true') && github.event.inputs.skip_tests != 'true'
+    with:
+      fix-formatting: false
+
+  security:
+    name: Security Tests
+    uses: ./.github/workflows/security.yml
+    needs: [detect-changes, code-quality]
+    if: success() && (needs.detect-changes.outputs.code-changed == 'true' || needs.detect-changes.outputs.terraform-changed == 'true' || github.event.inputs.force_deploy == 'true') && github.event.inputs.skip_tests != 'true'
+    with:
+      fail_on_high: ${{ github.ref == 'refs/heads/main' || github.event_name == 'release' }}
+      cache_key: ${{ needs.detect-changes.outputs.cache-key }}
+
+  test:
+    name: Run Tests
+    uses: ./.github/workflows/test.yml
+    needs: [detect-changes, code-quality]
+    if: success() && (needs.detect-changes.outputs.code-changed == 'true' || needs.detect-changes.outputs.tests-changed == 'true' || github.event.inputs.force_deploy == 'true') && github.event.inputs.skip_tests != 'true'
+    with:
+      python-version: '3.11'
+      parallel_jobs: ${{ env.PARALLEL_JOBS }}
+      cache_key: ${{ needs.detect-changes.outputs.cache-key }}
+
+  # Conditional build stage - only when code changes
+  build:
+    name: Build Packages and Images
+    uses: ./.github/workflows/build.yml
+    needs: [detect-changes, code-quality, security, test]
+    if: |
+      always() && 
+      needs.detect-changes.result == 'success' &&
+      (needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped') &&
+      (needs.security.result == 'success' || needs.security.result == 'skipped') &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.detect-changes.outputs.code-changed == 'true' || github.event.inputs.force_deploy == 'true')
+    with:
+      python-version: '3.11'
+      cache_key: ${{ needs.detect-changes.outputs.cache-key }}
+      code_changed: ${{ needs.detect-changes.outputs.code-changed }}
+
+  # Smart deployment stage - conditional and parallel
+  deploy:
+    name: Deploy to ${{ matrix.environment }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, code-quality, security, test, build, deployment-validation, deployment-approval]
+    if: |
+      always() && 
+      needs.detect-changes.outputs.should-deploy == 'true' &&
+      needs.detect-changes.result == 'success' &&
+      (needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped') &&
+      (needs.security.result == 'success' || needs.security.result == 'skipped') &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped') &&
+      needs.deployment-validation.result == 'success' &&
+      (needs.deployment-approval.result == 'success' || needs.deployment-approval.result == 'skipped')
+    
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.target-environments) }}
+      fail-fast: false  # Allow other environments to deploy even if one fails
+    
+    environment: 
+      name: ${{ matrix.environment }}
+      url: https://${{ matrix.environment }}.homebrew-sync.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        run: |
+          # Set environment-specific variables
+          case "${{ matrix.environment }}" in
+            "dev")
+              echo "AWS_REGION=us-west-2" >> $GITHUB_ENV
+              echo "AWS_ROLE_ARN=${{ secrets.AWS_ROLE_ARN_DEV }}" >> $GITHUB_ENV
+              ;;
+            "staging")
+              echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
+              echo "AWS_ROLE_ARN=${{ secrets.AWS_ROLE_ARN_STAGING }}" >> $GITHUB_ENV
+              ;;
+            "prod")
+              echo "AWS_REGION=us-east-1" >> $GITHUB_ENV
+              echo "AWS_ROLE_ARN=${{ secrets.AWS_ROLE_ARN_PROD }}" >> $GITHUB_ENV
+              ;;
+          esac
+
+  # Deployment validation stage
+  deployment-validation:
+    name: Validate Deployment for ${{ matrix.environment }}
+    uses: ./.github/workflows/deployment-validation.yml
+    needs: [detect-changes, code-quality, security, test, build]
+    if: |
+      always() && 
+      needs.detect-changes.outputs.should-deploy == 'true' &&
+      needs.detect-changes.result == 'success' &&
+      (needs.code-quality.result == 'success' || needs.code-quality.result == 'skipped') &&
+      (needs.security.result == 'success' || needs.security.result == 'skipped') &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped') &&
+      (needs.build.result == 'success' || needs.build.result == 'skipped')
+    
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.target-environments) }}
+      fail-fast: false
+    
+    with:
+      environment: ${{ matrix.environment }}
+      fail_on_drift: ${{ matrix.environment == 'prod' }}
+      skip_aws_checks: false
+    secrets: inherit
+
+  # Deployment approval stage
+  deployment-approval:
+    name: Approve Deployment for ${{ matrix.environment }}
+    uses: ./.github/workflows/deployment-approval.yml
+    needs: [detect-changes, deployment-validation]
+    if: |
+      always() &&
+      needs.deployment-validation.result == 'success' &&
+      (matrix.environment == 'prod' || needs.deployment-validation.outputs.drift_detected == 'true')
+    
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.target-environments) }}
+      fail-fast: false
+    
+    with:
+      environment: ${{ matrix.environment }}
+      commit_sha: ${{ github.sha }}
+      estimated_cost: ${{ needs.deployment-validation.outputs.estimated_cost }}
+      drift_detected: ${{ needs.deployment-validation.outputs.drift_detected == 'true' }}
+    secrets: inherit
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-${{ matrix.environment }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python with caching
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Cache Terraform state and providers
+        uses: actions/cache@v3
+        with:
+          path: |
+            terraform/.terraform
+            ~/.terraform.d/plugin-cache
+          key: ${{ env.CACHE_VERSION }}-terraform-${{ matrix.environment }}-${{ hashFiles('terraform/.terraform.lock.hcl') }}
+          restore-keys: |
+            ${{ env.CACHE_VERSION }}-terraform-${{ matrix.environment }}-
+
+      - name: Check for infrastructure changes
+        id: infra-changes
+        run: |
+          # Generate terraform vars
+          python scripts/config_processor.py --environment ${{ matrix.environment }} --output terraform/${{ matrix.environment }}.tfvars
+          
+          cd terraform
+          export TF_PLUGIN_CACHE_DIR="$HOME/.terraform.d/plugin-cache"
+          mkdir -p $TF_PLUGIN_CACHE_DIR
+          
+          terraform init
+          terraform workspace select ${{ matrix.environment }} || terraform workspace new ${{ matrix.environment }}
+          
+          # Create plan and check for changes
+          terraform plan -var-file="${{ matrix.environment }}.tfvars" -out=${{ matrix.environment }}.tfplan -detailed-exitcode
+          PLAN_EXIT_CODE=$?
+          
+          if [ $PLAN_EXIT_CODE -eq 0 ]; then
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "📋 No infrastructure changes detected"
+          elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "🔄 Infrastructure changes detected"
+          else
+            echo "❌ Terraform plan failed"
+            exit 1
+          fi
+
+      - name: Apply infrastructure changes
+        if: steps.infra-changes.outputs.has-changes == 'true' || github.event.inputs.force_deploy == 'true'
+        run: |
+          cd terraform
+          echo "🚀 Applying infrastructure changes to ${{ matrix.environment }}"
+          terraform apply ${{ matrix.environment }}.tfplan
+
+      - name: Skip deployment (no changes)
+        if: steps.infra-changes.outputs.has-changes == 'false' && github.event.inputs.force_deploy != 'true'
+        run: |
+          echo "⏭️ Skipping deployment - no infrastructure changes detected"
+          echo "To force deployment, use workflow_dispatch with force_deploy=true"
+
+      - name: Run smoke tests
+        if: steps.infra-changes.outputs.has-changes == 'true' || github.event.inputs.force_deploy == 'true'
+        run: |
+          python -m pytest tests/smoke/ -v --environment=${{ matrix.environment }} --maxfail=3
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          python scripts/notify_deployment.py \
+            --environment ${{ matrix.environment }} \
+            --status success \
+            --commit ${{ github.sha }} \
+            --changes-applied ${{ steps.infra-changes.outputs.has-changes }}
+
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          python scripts/notify_deployment.py \
+            --environment ${{ matrix.environment }} \
+            --status failure \
+            --commit ${{ github.sha }} \
+            --error "Deployment failed - check logs for details"
+
+  # Cost optimization integration
+  cost-optimization:
+    name: Cost Optimization
+    uses: ./.github/workflows/cost-optimization.yml
+    needs: [deploy]
+    if: success() && needs.deploy.result == 'success'
+    with:
+      environment: ${{ fromJson(needs.detect-changes.outputs.target-environments)[0] }}
+      action: 'analyze'
+    secrets: inherit
+
+  # Pipeline summary and reporting
+  pipeline-summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs: [detect-changes, code-quality, security, test, build, deployment-validation, deployment-approval, deploy, cost-optimization]
+    if: always()
+    
+    steps:
+      - name: Generate pipeline summary
+        run: |
+          echo "## 🚀 CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Pipeline trigger info
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch/Tag:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Change detection results
+          echo "### 📊 Change Detection" >> $GITHUB_STEP_SUMMARY
+          echo "- **Config Changed:** ${{ needs.detect-changes.outputs.config-changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Terraform Changed:** ${{ needs.detect-changes.outputs.terraform-changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Code Changed:** ${{ needs.detect-changes.outputs.code-changed }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Should Deploy:** ${{ needs.detect-changes.outputs.should-deploy }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Target Environments:** ${{ needs.detect-changes.outputs.target-environments }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Stage results
+          echo "### 🔍 Stage Results" >> $GITHUB_STEP_SUMMARY
+          
+          # Change detection
+          if [ "${{ needs.detect-changes.result }}" == "success" ]; then
+            echo "✅ **Change Detection**: Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Change Detection**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Code quality
+          if [ "${{ needs.code-quality.result }}" == "success" ]; then
+            echo "✅ **Code Quality**: Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.code-quality.result }}" == "skipped" ]; then
+            echo "⏭️ **Code Quality**: Skipped (no changes)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Code Quality**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Security tests
+          if [ "${{ needs.security.result }}" == "success" ]; then
+            echo "✅ **Security Tests**: Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.security.result }}" == "skipped" ]; then
+            echo "⏭️ **Security Tests**: Skipped (no changes)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Security Tests**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Unit/Integration tests
+          if [ "${{ needs.test.result }}" == "success" ]; then
+            echo "✅ **Tests**: Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.test.result }}" == "skipped" ]; then
+            echo "⏭️ **Tests**: Skipped (no changes)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Tests**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Build
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            echo "✅ **Build**: Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build.result }}" == "skipped" ]; then
+            echo "⏭️ **Build**: Skipped (no code changes)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Build**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Deployment validation
+          if [ "${{ needs.deployment-validation.result }}" == "success" ]; then
+            echo "✅ **Deployment Validation**: Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.deployment-validation.result }}" == "skipped" ]; then
+            echo "⏭️ **Deployment Validation**: Skipped" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment Validation**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Deployment approval
+          if [ "${{ needs.deployment-approval.result }}" == "success" ]; then
+            echo "✅ **Deployment Approval**: Approved" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.deployment-approval.result }}" == "skipped" ]; then
+            echo "⏭️ **Deployment Approval**: Not Required" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment Approval**: Rejected/Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Deployment
+          if [ "${{ needs.deploy.result }}" == "success" ]; then
+            echo "✅ **Deployment**: Successful" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.deploy.result }}" == "skipped" ]; then
+            echo "⏭️ **Deployment**: Skipped (no changes to deploy)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Overall result
+          if [ "${{ needs.detect-changes.result }}" == "success" ] && \
+             ([ "${{ needs.code-quality.result }}" == "success" ] || [ "${{ needs.code-quality.result }}" == "skipped" ]) && \
+             ([ "${{ needs.security.result }}" == "success" ] || [ "${{ needs.security.result }}" == "skipped" ]) && \
+             ([ "${{ needs.test.result }}" == "success" ] || [ "${{ needs.test.result }}" == "skipped" ]) && \
+             ([ "${{ needs.build.result }}" == "success" ] || [ "${{ needs.build.result }}" == "skipped" ]) && \
+             ([ "${{ needs.deployment-validation.result }}" == "success" ] || [ "${{ needs.deployment-validation.result }}" == "skipped" ]) && \
+             ([ "${{ needs.deployment-approval.result }}" == "success" ] || [ "${{ needs.deployment-approval.result }}" == "skipped" ]) && \
+             ([ "${{ needs.deploy.result }}" == "success" ] || [ "${{ needs.deploy.result }}" == "skipped" ]); then
+            echo "🎉 **Overall Result**: PIPELINE SUCCESSFUL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "💥 **Overall Result**: PIPELINE FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Cost optimization
+          if [ "${{ needs.cost-optimization.result }}" == "success" ]; then
+            echo "✅ **Cost Optimization**: Analysis completed" >> $GITHUB_STEP_SUMMARY
+            if [ "${{ needs.cost-optimization.outputs.optimization_applied }}" == "true" ]; then
+              echo "  - Optimizations applied: \$${{ needs.cost-optimization.outputs.estimated_savings }}/month savings" >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [ "${{ needs.cost-optimization.result }}" == "skipped" ]; then
+            echo "⏭️ **Cost Optimization**: Skipped (deployment not successful)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Cost Optimization**: Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Performance metrics
+          echo "### ⚡ Performance & Cost Optimizations Applied" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Parallel job execution" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Dependency caching" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Conditional deployment logic" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Change-based stage skipping" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Smart environment targeting" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Automated cost optimization" >> $GITHUB_STEP_SUMMARY

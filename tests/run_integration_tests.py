@@ -18,6 +18,14 @@ from typing import List, Dict, Any
 sys.path.append('.')
 sys.path.append('shared')
 
+# Integration test categories
+INTEGRATION_TEST_CATEGORIES = {
+    'aws': 'tests/integration/test_aws_services.py',
+    'terraform': 'tests/integration/test_terraform_modules.py',
+    'workflows': 'tests/integration/test_end_to_end_workflows.py',
+    'existing': 'tests/test_integration_e2e.py'
+}
+
 
 def run_pytest_command(test_files: List[str], extra_args: List[str] = None) -> Dict[str, Any]:
     """
@@ -30,7 +38,7 @@ def run_pytest_command(test_files: List[str], extra_args: List[str] = None) -> D
     Returns:
         Dictionary with test results
     """
-    cmd = ['python', '-m', 'pytest'] + test_files
+    cmd = ['python3', '-m', 'pytest'] + test_files
     
     # Default pytest arguments
     default_args = [
@@ -127,20 +135,28 @@ def validate_test_files() -> List[str]:
     Returns:
         List of valid test file paths
     """
-    test_dir = Path('tests')
-    integration_test_files = [
-        'test_integration_e2e.py',
-        'test_integration_error_scenarios.py',
-        'test_integration.py'  # Existing integration test
-    ]
-    
     valid_files = []
     
-    for test_file in integration_test_files:
+    # Check integration directory tests
+    integration_dir = Path('tests/integration')
+    if integration_dir.exists():
+        for test_file in integration_dir.glob('test_*.py'):
+            valid_files.append(str(test_file))
+            print(f"✅ Found integration test: {test_file.name}")
+    
+    # Check existing integration tests in main tests directory
+    test_dir = Path('tests')
+    existing_integration_files = [
+        'test_integration_e2e.py',
+        'test_integration_error_scenarios.py',
+        'test_integration.py'
+    ]
+    
+    for test_file in existing_integration_files:
         test_path = test_dir / test_file
         if test_path.exists():
             valid_files.append(str(test_path))
-            print(f"✅ Found test file: {test_file}")
+            print(f"✅ Found existing test: {test_file}")
         else:
             print(f"⚠️  Test file not found: {test_file}")
     
@@ -199,23 +215,39 @@ def run_specific_test_categories(categories: List[str]) -> Dict[str, Dict[str, A
         Dictionary of test results
     """
     category_mapping = {
+        'aws': 'tests/integration/test_aws_services.py',
+        'terraform': 'tests/integration/test_terraform_modules.py',
+        'workflows': 'tests/integration/test_end_to_end_workflows.py',
         'lambda': 'TestLambdaBasedSyncWorkflow',
         'ecs': 'TestECSBasedSyncWorkflow',
         'errors': 'TestErrorHandlingAndRecovery',
-        'communication': 'TestCrossServiceCommunication',
-        'network': 'TestNetworkErrorScenarios',
-        'corruption': 'TestDataCorruptionScenarios',
-        'resources': 'TestResourceExhaustionScenarios',
-        'concurrency': 'TestConcurrencyAndRaceConditions',
-        'edge': 'TestEdgeCaseScenarios'
+        'communication': 'TestCrossServiceCommunication'
     }
     
     results = {}
-    test_files = validate_test_files()
     
     for category in categories:
-        if category in category_mapping:
+        if category in INTEGRATION_TEST_CATEGORIES:
+            # Run specific test file
+            test_file = INTEGRATION_TEST_CATEGORIES[category]
+            if Path(test_file).exists():
+                print(f"\n🧪 Running {category} integration tests...")
+                
+                result = run_pytest_command([test_file], ['-v'])
+                results[f"{category}_integration_tests"] = result
+                
+                if result['success']:
+                    print(f"✅ {category} integration tests passed")
+                else:
+                    print(f"❌ {category} integration tests failed")
+                    if result['stderr']:
+                        print(f"Error: {result['stderr']}")
+            else:
+                print(f"⚠️  Test file not found: {test_file}")
+        elif category in category_mapping:
+            # Run specific test class
             class_name = category_mapping[category]
+            test_files = validate_test_files()
             print(f"\n🧪 Running {category} tests ({class_name})...")
             
             result = run_pytest_command(
@@ -246,8 +278,8 @@ def main():
     parser.add_argument(
         '--categories',
         nargs='+',
-        choices=['lambda', 'ecs', 'errors', 'communication', 'network', 
-                'corruption', 'resources', 'concurrency', 'edge', 'all'],
+        choices=['aws', 'terraform', 'workflows', 'existing', 'lambda', 'ecs', 
+                'errors', 'communication', 'all'],
         default=['all'],
         help='Test categories to run'
     )

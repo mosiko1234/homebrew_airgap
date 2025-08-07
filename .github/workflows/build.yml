@@ -1,0 +1,467 @@
+name: Build and Package
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        default: '3.11'
+        type: string
+      environment:
+        description: 'Environment to build for'
+        required: false
+        default: 'dev'
+        type: string
+      cache_key:
+        description: 'Cache key for dependencies'
+        required: false
+        default: ''
+        type: string
+      code_changed:
+        description: 'Whether code has changed'
+        required: false
+        default: 'true'
+        type: string
+    outputs:
+      lambda-artifacts:
+        description: 'Lambda package artifacts'
+        value: ${{ jobs.build-lambda.outputs.artifacts }}
+      docker-images:
+        description: 'Docker image tags'
+        value: ${{ jobs.build-docker.outputs.images }}
+
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        default: '3.11'
+        type: string
+      environment:
+        description: 'Environment to build for'
+        required: false
+        default: 'dev'
+        type: string
+
+env:
+  REGISTRY: ${{ secrets.ECR_REGISTRY || '123456789012.dkr.ecr.us-east-1.amazonaws.com' }}
+  PYTHON_VERSION: ${{ inputs.python-version }}
+  CACHE_VERSION: 'v2'
+
+jobs:
+  # Build Lambda packages
+  build-lambda:
+    name: Build Lambda Packages
+    runs-on: ubuntu-latest
+    outputs:
+      artifacts: ${{ steps.package.outputs.artifacts }}
+    
+    strategy:
+      matrix:
+        function: [orchestrator, sync]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache Python dependencies (enhanced)
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pip
+            build/lambda/${{ matrix.function }}
+          key: ${{ env.CACHE_VERSION }}-lambda-${{ matrix.function }}-${{ runner.os }}-${{ env.PYTHON_VERSION }}-${{ hashFiles('lambda/${{ matrix.function }}/requirements.txt', 'requirements.txt', 'shared/**/*.py') }}
+          restore-keys: |
+            ${{ env.CACHE_VERSION }}-lambda-${{ matrix.function }}-${{ runner.os }}-${{ env.PYTHON_VERSION }}-
+            ${{ env.CACHE_VERSION }}-lambda-${{ matrix.function }}-${{ runner.os }}-
+            ${{ env.CACHE_VERSION }}-lambda-${{ matrix.function }}-
+
+      - name: Create build directory
+        run: |
+          mkdir -p build/lambda/${{ matrix.function }}
+          mkdir -p dist/lambda
+
+      - name: Install dependencies (optimized)
+        run: |
+          # Check if we can use cached build
+          if [ -d "build/lambda/${{ matrix.function }}" ] && [ -f "build/lambda/${{ matrix.function }}/.build_complete" ]; then
+            echo "📦 Using cached Lambda build for ${{ matrix.function }}"
+            # Still need to copy latest code changes
+            cp lambda/${{ matrix.function }}/*.py build/lambda/${{ matrix.function }}/
+            cp -r shared build/lambda/${{ matrix.function }}/
+          else
+            echo "🔨 Building Lambda package for ${{ matrix.function }}"
+            cd lambda/${{ matrix.function }}
+            
+            # Install dependencies with optimizations
+            pip install --no-deps --target ../../build/lambda/${{ matrix.function }}/ -r requirements.txt
+            
+            # Install shared modules
+            cp -r ../../shared ../../build/lambda/${{ matrix.function }}/
+            
+            # Copy function code
+            cp *.py ../../build/lambda/${{ matrix.function }}/
+            
+            # Mark build as complete
+            touch ../../build/lambda/${{ matrix.function }}/.build_complete
+          fi
+
+      - name: Remove unnecessary files
+        run: |
+          cd build/lambda/${{ matrix.function }}
+          
+          # Remove test files and cache
+          find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+          find . -type f -name "*.pyc" -delete
+          find . -type f -name "*.pyo" -delete
+          find . -type f -name "*.pyd" -delete
+          find . -type f -name ".DS_Store" -delete
+          
+          # Remove development dependencies
+          rm -rf pip* setuptools* wheel* 2>/dev/null || true
+          
+          # Remove documentation and examples
+          find . -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "examples" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Create Lambda package
+        id: package
+        run: |
+          cd build/lambda/${{ matrix.function }}
+          
+          # Create deployment package
+          zip -r ../../../dist/lambda/${{ matrix.function }}-${{ github.sha }}.zip . -x "*.git*" "*.DS_Store*"
+          
+          # Create version without commit hash for latest
+          cp ../../../dist/lambda/${{ matrix.function }}-${{ github.sha }}.zip ../../../dist/lambda/${{ matrix.function }}-latest.zip
+          
+          # Get package size
+          PACKAGE_SIZE=$(stat -f%z ../../../dist/lambda/${{ matrix.function }}-${{ github.sha }}.zip 2>/dev/null || stat -c%s ../../../dist/lambda/${{ matrix.function }}-${{ github.sha }}.zip)
+          echo "Package size: $(($PACKAGE_SIZE / 1024 / 1024)) MB"
+          
+          # Check size limit (50MB for Lambda)
+          if [ $PACKAGE_SIZE -gt 52428800 ]; then
+            echo "Error: Package size exceeds 50MB limit"
+            exit 1
+          fi
+          
+          echo "artifacts=${{ matrix.function }}-${{ github.sha }}.zip" >> $GITHUB_OUTPUT
+
+      - name: Upload Lambda artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: lambda-${{ matrix.function }}-package
+          path: |
+            dist/lambda/${{ matrix.function }}-${{ github.sha }}.zip
+            dist/lambda/${{ matrix.function }}-latest.zip
+          retention-days: 30
+
+      - name: Generate package manifest
+        run: |
+          cd build/lambda/${{ matrix.function }}
+          
+          # Create manifest with package contents
+          echo "# Lambda Package Manifest - ${{ matrix.function }}" > ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+          echo "Built: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+          echo "Commit: ${{ github.sha }}" >> ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+          echo "Python: ${{ env.PYTHON_VERSION }}" >> ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+          echo "" >> ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+          echo "## Package Contents:" >> ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+          find . -type f | sort >> ../../../dist/lambda/${{ matrix.function }}-manifest.txt
+
+      - name: Upload package manifest
+        uses: actions/upload-artifact@v3
+        with:
+          name: lambda-${{ matrix.function }}-manifest
+          path: dist/lambda/${{ matrix.function }}-manifest.txt
+
+  # Build Docker images for ECS
+  build-docker:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.build.outputs.images }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers (enhanced)
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ env.CACHE_VERSION }}-buildx-${{ runner.os }}-${{ hashFiles('ecs/sync/Dockerfile', 'ecs/sync/requirements.txt', 'shared/**/*.py') }}
+          restore-keys: |
+            ${{ env.CACHE_VERSION }}-buildx-${{ runner.os }}-
+            ${{ env.CACHE_VERSION }}-buildx-
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN_DEV }}
+          role-session-name: GitHubActions-Build
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push sync worker image (optimized)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./ecs/sync/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/homebrew-sync:${{ github.sha }}
+            ${{ env.REGISTRY }}/homebrew-sync:latest
+            ${{ env.REGISTRY }}/homebrew-sync:${{ inputs.environment }}
+          cache-from: |
+            type=local,src=/tmp/.buildx-cache
+            type=registry,ref=${{ env.REGISTRY }}/homebrew-sync:buildcache
+          cache-to: |
+            type=local,dest=/tmp/.buildx-cache-new,mode=max
+            type=registry,ref=${{ env.REGISTRY }}/homebrew-sync:buildcache,mode=max
+          build-args: |
+            PYTHON_VERSION=${{ env.PYTHON_VERSION }}
+            BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            VCS_REF=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.title=Homebrew Sync Worker
+            org.opencontainers.image.description=ECS worker for syncing Homebrew bottles
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.created=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+            org.opencontainers.image.revision=${{ github.sha }}
+          # Multi-stage build optimizations
+          target: runtime
+          pull: true
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      - name: Generate image manifest
+        run: |
+          echo "# Docker Image Manifest" > docker-manifest.txt
+          echo "Built: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> docker-manifest.txt
+          echo "Commit: ${{ github.sha }}" >> docker-manifest.txt
+          echo "Registry: ${{ env.REGISTRY }}" >> docker-manifest.txt
+          echo "" >> docker-manifest.txt
+          echo "## Images:" >> docker-manifest.txt
+          echo "- ${{ env.REGISTRY }}/homebrew-sync:${{ github.sha }}" >> docker-manifest.txt
+          echo "- ${{ env.REGISTRY }}/homebrew-sync:latest" >> docker-manifest.txt
+          echo "- ${{ env.REGISTRY }}/homebrew-sync:${{ inputs.environment }}" >> docker-manifest.txt
+          
+          # Get image digest
+          IMAGE_DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/homebrew-sync:${{ github.sha }} --format '{{.Manifest.Digest}}')
+          echo "" >> docker-manifest.txt
+          echo "## Image Details:" >> docker-manifest.txt
+          echo "Digest: $IMAGE_DIGEST" >> docker-manifest.txt
+
+      - name: Upload Docker manifest
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-manifest
+          path: docker-manifest.txt
+
+      - name: Set output
+        run: |
+          echo "images=${{ env.REGISTRY }}/homebrew-sync:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  # Create shared layer for Lambda functions
+  build-lambda-layer:
+    name: Build Lambda Layer
+    runs-on: ubuntu-latest
+    outputs:
+      layer-arn: ${{ steps.layer.outputs.arn }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache layer dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-layer-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-layer-
+            ${{ runner.os }}-pip-
+
+      - name: Create layer directory
+        run: |
+          mkdir -p build/layer/python/lib/python${{ env.PYTHON_VERSION }}/site-packages
+          mkdir -p dist/layer
+
+      - name: Install shared dependencies
+        run: |
+          pip install -r requirements.txt -t build/layer/python/lib/python${{ env.PYTHON_VERSION }}/site-packages/
+          
+          # Copy shared modules
+          cp -r shared build/layer/python/lib/python${{ env.PYTHON_VERSION }}/site-packages/
+
+      - name: Clean layer
+        run: |
+          cd build/layer/python/lib/python${{ env.PYTHON_VERSION }}/site-packages
+          
+          # Remove unnecessary files
+          find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+          find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+          find . -type f -name "*.pyc" -delete
+          find . -type f -name "*.pyo" -delete
+          find . -type f -name "*.pyd" -delete
+          find . -type f -name ".DS_Store" -delete
+          
+          # Remove development dependencies
+          rm -rf pip* setuptools* wheel* 2>/dev/null || true
+
+      - name: Create layer package
+        run: |
+          cd build/layer
+          zip -r ../../dist/layer/shared-layer-${{ github.sha }}.zip . -x "*.git*" "*.DS_Store*"
+          cp ../../dist/layer/shared-layer-${{ github.sha }}.zip ../../dist/layer/shared-layer-latest.zip
+          
+          # Check size limit (250MB for layers)
+          LAYER_SIZE=$(stat -f%z ../../dist/layer/shared-layer-${{ github.sha }}.zip 2>/dev/null || stat -c%s ../../dist/layer/shared-layer-${{ github.sha }}.zip)
+          echo "Layer size: $(($LAYER_SIZE / 1024 / 1024)) MB"
+          
+          if [ $LAYER_SIZE -gt 262144000 ]; then
+            echo "Error: Layer size exceeds 250MB limit"
+            exit 1
+          fi
+
+      - name: Upload layer artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: lambda-shared-layer
+          path: |
+            dist/layer/shared-layer-${{ github.sha }}.zip
+            dist/layer/shared-layer-latest.zip
+          retention-days: 30
+
+  # Build summary and validation
+  build-summary:
+    name: Build Summary
+    runs-on: ubuntu-latest
+    needs: [build-lambda, build-docker, build-lambda-layer]
+    if: always()
+    
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate build summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Lambda packages
+          echo "### Lambda Packages" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.build-lambda.result }}" == "success" ]; then
+            echo "✅ **Lambda Functions**: Built successfully" >> $GITHUB_STEP_SUMMARY
+            echo "- Orchestrator: ${{ needs.build-lambda.outputs.artifacts }}" >> $GITHUB_STEP_SUMMARY
+            echo "- Sync Worker: ${{ needs.build-lambda.outputs.artifacts }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Lambda Functions**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Docker images
+          echo "### Docker Images" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.build-docker.result }}" == "success" ]; then
+            echo "✅ **Docker Images**: Built and pushed successfully" >> $GITHUB_STEP_SUMMARY
+            echo "- Image: ${{ needs.build-docker.outputs.images }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Docker Images**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Lambda layer
+          echo "### Lambda Layer" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ needs.build-lambda-layer.result }}" == "success" ]; then
+            echo "✅ **Shared Layer**: Built successfully" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Shared Layer**: Build failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Overall result
+          if [ "${{ needs.build-lambda.result }}" == "success" ] && \
+             [ "${{ needs.build-docker.result }}" == "success" ] && \
+             [ "${{ needs.build-lambda-layer.result }}" == "success" ]; then
+            echo "🎉 **Overall Result**: ALL BUILDS SUCCESSFUL" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "💥 **Overall Result**: SOME BUILDS FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Create build report
+        run: |
+          echo "# Build Report" > build-report.md
+          echo "" >> build-report.md
+          echo "**Build Date:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> build-report.md
+          echo "**Commit:** ${{ github.sha }}" >> build-report.md
+          echo "**Branch:** ${{ github.ref_name }}" >> build-report.md
+          echo "**Environment:** ${{ inputs.environment }}" >> build-report.md
+          echo "" >> build-report.md
+          
+          # Add artifact information
+          echo "## Artifacts" >> build-report.md
+          echo "" >> build-report.md
+          
+          if [ -d "lambda-orchestrator-package" ]; then
+            echo "### Lambda Orchestrator" >> build-report.md
+            ls -la lambda-orchestrator-package/ >> build-report.md
+            echo "" >> build-report.md
+          fi
+          
+          if [ -d "lambda-sync-package" ]; then
+            echo "### Lambda Sync Worker" >> build-report.md
+            ls -la lambda-sync-package/ >> build-report.md
+            echo "" >> build-report.md
+          fi
+          
+          if [ -d "lambda-shared-layer" ]; then
+            echo "### Shared Layer" >> build-report.md
+            ls -la lambda-shared-layer/ >> build-report.md
+            echo "" >> build-report.md
+          fi
+          
+          if [ -f "docker-manifest.txt" ]; then
+            echo "### Docker Images" >> build-report.md
+            cat docker-manifest.txt >> build-report.md
+            echo "" >> build-report.md
+          fi
+
+      - name: Upload build report
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-report
+          path: build-report.md
+
+      - name: Fail job if builds failed
+        if: needs.build-lambda.result != 'success' || needs.build-docker.result != 'success' || needs.build-lambda-layer.result != 'success'
+        run: exit 1

@@ -587,3 +587,46 @@ variable "external_hash_file_url" {
     error_message = "External hash file URL must be HTTPS."
   }
 }
+
+# Environment Isolation Configuration
+variable "github_repository" {
+  description = "GitHub repository for OIDC trust relationship (format: org/repo)"
+  type        = string
+  default     = ""
+}
+
+variable "dev_aws_account_id" {
+  description = "AWS Account ID for development environment (optional for multi-account setup)"
+  type        = string
+  default     = ""
+}
+
+variable "staging_aws_account_id" {
+  description = "AWS Account ID for staging environment (optional for multi-account setup)"
+  type        = string
+  default     = ""
+}
+
+variable "prod_aws_account_id" {
+  description = "AWS Account ID for production environment (optional for multi-account setup)"
+  type        = string
+  default     = ""
+}
+
+variable "enable_multi_account_isolation" {
+  description = "Enable multi-account isolation features"
+  type        = bool
+  default     = false
+}
+
+variable "enable_cross_environment_isolation" {
+  description = "Enable policies that prevent cross-environment access"
+  type        = bool
+  default     = true
+}
+
+variable "enforce_resource_tagging" {
+  description = "Enforce consistent resource tagging"
+  type        = bool
+  default     = true
+}

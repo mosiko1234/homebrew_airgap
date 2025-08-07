@@ -1,0 +1,509 @@
+name: Comprehensive Testing
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        default: '3.11'
+        type: string
+      environment:
+        description: 'Environment to test against'
+        required: false
+        default: 'test'
+        type: string
+    outputs:
+      test-results:
+        description: 'Overall test results'
+        value: ${{ jobs.report-results.outputs.results }}
+      coverage:
+        description: 'Test coverage percentage'
+        value: ${{ jobs.unit-tests.outputs.coverage }}
+
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: 'Python version to use'
+        required: false
+        default: '3.11'
+        type: string
+      environment:
+        description: 'Environment to test against'
+        required: false
+        default: 'test'
+        type: string
+
+env:
+  PYTHONPATH: ${{ github.workspace }}
+  AWS_DEFAULT_REGION: us-east-1
+
+jobs:
+  # Unit Tests - Fast, isolated tests
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    outputs:
+      coverage: ${{ steps.coverage.outputs.percentage }}
+      status: ${{ steps.test.outcome }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-mock pytest-asyncio coverage[toml]
+
+      - name: Run unit tests
+        id: test
+        run: |
+          python -m pytest tests/unit/ \
+            --cov=lambda \
+            --cov=shared \
+            --cov=scripts \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --cov-report=html \
+            --junit-xml=unit-test-results.xml \
+            --tb=short \
+            -v
+
+      - name: Extract coverage percentage
+        id: coverage
+        run: |
+          COVERAGE=$(python -c "import xml.etree.ElementTree as ET; tree = ET.parse('coverage.xml'); root = tree.getroot(); print(f\"{float(root.attrib['line-rate']) * 100:.1f}\")")
+          echo "percentage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "Coverage: $COVERAGE%"
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: unit-test-results
+          path: |
+            unit-test-results.xml
+            coverage.xml
+            htmlcov/
+
+      - name: Publish unit test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: unit-test-results.xml
+          check_name: "Unit Test Results"
+
+      - name: Comment coverage on PR
+        if: github.event_name == 'pull_request'
+        uses: py-cov-action/python-coverage-comment-action@v3
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          MINIMUM_GREEN: 80
+          MINIMUM_ORANGE: 70
+
+  # Integration Tests - Test AWS service interactions
+  integration-tests:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.test.outcome }}
+    
+    services:
+      localstack:
+        image: localstack/localstack:latest
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3,lambda,ecs,events,logs,iam
+          DEBUG: 1
+          DATA_DIR: /tmp/localstack/data
+        options: >-
+          --health-cmd="curl -f http://localhost:4566/_localstack/health || exit 1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Cache Python dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-integration-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-integration-
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio boto3 moto localstack-client
+
+      - name: Wait for LocalStack
+        run: |
+          timeout 60 bash -c 'until curl -f http://localhost:4566/_localstack/health; do sleep 2; done'
+
+      - name: Set up test environment
+        run: |
+          export AWS_ACCESS_KEY_ID=test
+          export AWS_SECRET_ACCESS_KEY=test
+          export AWS_DEFAULT_REGION=us-east-1
+          export AWS_ENDPOINT_URL=http://localhost:4566
+          
+          # Create test S3 bucket
+          aws --endpoint-url=http://localhost:4566 s3 mb s3://test-homebrew-bottles
+          
+          # Create test Lambda functions
+          cd lambda/orchestrator
+          zip -r orchestrator.zip .
+          aws --endpoint-url=http://localhost:4566 lambda create-function \
+            --function-name test-orchestrator \
+            --runtime python3.11 \
+            --role arn:aws:iam::123456789012:role/test-role \
+            --handler handler.lambda_handler \
+            --zip-file fileb://orchestrator.zip
+
+      - name: Run integration tests
+        id: test
+        env:
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          AWS_DEFAULT_REGION: us-east-1
+          AWS_ENDPOINT_URL: http://localhost:4566
+        run: |
+          python -m pytest tests/integration/ \
+            --junit-xml=integration-test-results.xml \
+            --tb=short \
+            -v \
+            --maxfail=5
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: integration-test-results
+          path: integration-test-results.xml
+
+      - name: Publish integration test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: integration-test-results.xml
+          check_name: "Integration Test Results"
+
+  # Security Tests - Security scanning and validation
+  security-tests:
+    name: Security Tests
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.test.outcome }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install security tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install bandit safety semgrep pytest
+
+      - name: Run Bandit security scan
+        id: bandit
+        run: |
+          bandit -r lambda/ shared/ scripts/ -f json -o bandit-report.json || true
+          bandit -r lambda/ shared/ scripts/ -f txt
+
+      - name: Run Safety dependency scan
+        id: safety
+        run: |
+          safety check --json --output safety-report.json || true
+          safety check
+
+      - name: Run Semgrep security scan
+        id: semgrep
+        run: |
+          semgrep --config=auto --json --output=semgrep-report.json lambda/ shared/ scripts/ || true
+          semgrep --config=auto lambda/ shared/ scripts/
+
+      - name: Run security-focused tests
+        id: test
+        run: |
+          python -m pytest tests/security/ \
+            --junit-xml=security-test-results.xml \
+            --tb=short \
+            -v
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-scan-results
+          path: |
+            bandit-report.json
+            safety-report.json
+            semgrep-report.json
+            security-test-results.xml
+
+      - name: Publish security test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: security-test-results.xml
+          check_name: "Security Test Results"
+
+      - name: Upload SARIF results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep-report.json
+
+  # Terraform Tests - Validate infrastructure code
+  terraform-tests:
+    name: Terraform Tests
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.test.outcome }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+
+      - name: Install testing tools
+        run: |
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          sudo mv tfsec /usr/local/bin/
+          
+          # Install checkov
+          pip install checkov
+          
+          # Install terraform-docs
+          curl -sSLo ./terraform-docs.tar.gz https://terraform-docs.io/dl/v0.16.0/terraform-docs-v0.16.0-$(uname)-amd64.tar.gz
+          tar -xzf terraform-docs.tar.gz
+          chmod +x terraform-docs
+          sudo mv terraform-docs /usr/local/bin/
+
+      - name: Terraform format check
+        run: |
+          terraform fmt -check -recursive terraform/
+
+      - name: Terraform validate
+        run: |
+          cd terraform
+          terraform init -backend=false
+          terraform validate
+
+      - name: Run tfsec security scan
+        id: tfsec
+        run: |
+          tfsec terraform/ --format json --out tfsec-report.json || true
+          tfsec terraform/
+
+      - name: Run Checkov security scan
+        id: checkov
+        run: |
+          checkov -d terraform/ --framework terraform --output json --output-file checkov-report.json || true
+          checkov -d terraform/ --framework terraform
+
+      - name: Run Terraform module tests
+        id: test
+        run: |
+          python -m pytest tests/terraform/ \
+            --junit-xml=terraform-test-results.xml \
+            --tb=short \
+            -v
+
+      - name: Upload Terraform test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: terraform-test-results
+          path: |
+            tfsec-report.json
+            checkov-report.json
+            terraform-test-results.xml
+
+      - name: Publish Terraform test results
+        uses: EnricoMi/publish-unit-test-result-action@v2
+        if: always()
+        with:
+          files: terraform-test-results.xml
+          check_name: "Terraform Test Results"
+
+  # Code Quality Tests - Linting and formatting
+  code-quality:
+    name: Code Quality
+    runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.test.outcome }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install quality tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 black isort mypy pylint
+
+      - name: Run Black formatting check
+        run: |
+          black --check --diff lambda/ shared/ scripts/ tests/
+
+      - name: Run isort import sorting check
+        run: |
+          isort --check-only --diff lambda/ shared/ scripts/ tests/
+
+      - name: Run flake8 linting
+        run: |
+          flake8 lambda/ shared/ scripts/ tests/ --max-line-length=88 --extend-ignore=E203,W503
+
+      - name: Run mypy type checking
+        run: |
+          mypy lambda/ shared/ scripts/ --ignore-missing-imports
+
+      - name: Run pylint
+        id: test
+        run: |
+          pylint lambda/ shared/ scripts/ --output-format=json --reports=y > pylint-report.json || true
+          pylint lambda/ shared/ scripts/
+
+      - name: Upload code quality results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: code-quality-results
+          path: pylint-report.json
+
+  # Report overall test results
+  report-results:
+    name: Test Results Summary
+    runs-on: ubuntu-latest
+    needs: [unit-tests, integration-tests, security-tests, terraform-tests, code-quality]
+    if: always()
+    outputs:
+      results: ${{ steps.summary.outputs.results }}
+    
+    steps:
+      - name: Download all test artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate test summary
+        id: summary
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Unit Tests
+          if [ "${{ needs.unit-tests.outputs.status }}" == "success" ]; then
+            echo "✅ **Unit Tests**: PASSED (Coverage: ${{ needs.unit-tests.outputs.coverage }}%)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Unit Tests**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Integration Tests
+          if [ "${{ needs.integration-tests.outputs.status }}" == "success" ]; then
+            echo "✅ **Integration Tests**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Integration Tests**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Security Tests
+          if [ "${{ needs.security-tests.outputs.status }}" == "success" ]; then
+            echo "✅ **Security Tests**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Security Tests**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Terraform Tests
+          if [ "${{ needs.terraform-tests.outputs.status }}" == "success" ]; then
+            echo "✅ **Terraform Tests**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Terraform Tests**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Code Quality
+          if [ "${{ needs.code-quality.outputs.status }}" == "success" ]; then
+            echo "✅ **Code Quality**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Code Quality**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Overall result
+          if [ "${{ needs.unit-tests.result }}" == "success" ] && \
+             [ "${{ needs.integration-tests.result }}" == "success" ] && \
+             [ "${{ needs.security-tests.result }}" == "success" ] && \
+             [ "${{ needs.terraform-tests.result }}" == "success" ] && \
+             [ "${{ needs.code-quality.result }}" == "success" ]; then
+            echo "results=success" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🎉 **Overall Result**: ALL TESTS PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "results=failure" >> $GITHUB_OUTPUT
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💥 **Overall Result**: SOME TESTS FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Set status check
+        uses: actions/github-script@v6
+        if: always()
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const sha = context.sha;
+            const state = '${{ steps.summary.outputs.results }}' === 'success' ? 'success' : 'failure';
+            const description = state === 'success' ? 'All tests passed' : 'Some tests failed';
+            
+            await github.rest.repos.createCommitStatus({
+              owner,
+              repo,
+              sha,
+              state,
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+              description,
+              context: 'Comprehensive Tests'
+            });
+
+      - name: Fail job if tests failed
+        if: steps.summary.outputs.results == 'failure'
+        run: exit 1

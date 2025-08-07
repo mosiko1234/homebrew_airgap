@@ -1,0 +1,66 @@
+# Homebrew Bottles Sync System Configuration
+# This is the central configuration file for all environments
+
+# Global project configuration
+project:
+  name: "homebrew-bottles-sync"
+  description: "Automated Homebrew bottles sync system"
+  version: "1.0.0"
+
+# Environment configurations
+environments:
+  dev:
+    aws_region: "us-west-2"
+    size_threshold_gb: 5
+    schedule_expression: "cron(0 */6 * * ? *)"
+    enable_fargate_spot: true
+    auto_shutdown: true
+    
+  staging:
+    aws_region: "us-east-1"
+    size_threshold_gb: 15
+    schedule_expression: "cron(0 3 ? * SAT *)"
+    enable_fargate_spot: true
+    auto_shutdown: false
+    
+  prod:
+    aws_region: "us-east-1"
+    size_threshold_gb: 20
+    schedule_expression: "cron(0 3 ? * SUN *)"
+    enable_fargate_spot: false
+    auto_shutdown: false
+
+# Resource configurations
+resources:
+  lambda:
+    orchestrator_memory: 512
+    sync_memory: 3008
+    timeout: 900
+    
+  ecs:
+    task_cpu: 2048
+    task_memory: 8192
+    ephemeral_storage: 100
+
+# Notification settings
+notifications:
+  slack:
+    enabled: true
+    channel: "#platform-updates"
+  email:
+    enabled: true
+    addresses: ["devops@company.com"]
+
+# Cost optimization settings
+cost_optimization:
+  dev_shutdown_schedule: "cron(0 20 * * MON-FRI)"
+  dev_startup_schedule: "cron(0 8 * * MON-FRI)"
+  cost_threshold_usd: 100
+  enable_cost_alerts: true
+
+# Security settings
+security:
+  enable_vpc_flow_logs: true
+  enable_cloudtrail: true
+  encryption_at_rest: true
+  encryption_in_transit: true

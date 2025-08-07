@@ -1,0 +1,299 @@
+# Security Monitoring Configuration
+# This file defines security policies, thresholds, and monitoring rules
+
+# Global security settings
+global:
+  monitoring_enabled: true
+  alert_retention_days: 90
+  compliance_check_interval_hours: 24
+  
+# Alert severity thresholds
+thresholds:
+  failed_login_attempts: 5
+  unusual_location_threshold: 3
+  high_privilege_action_threshold: 10
+  api_calls_per_minute_threshold: 100
+  suspicious_ip_threshold: 3
+  time_window_minutes: 60
+  
+# Risk scoring configuration
+risk_scoring:
+  base_score: 0
+  high_risk_actions_score: 40
+  suspicious_user_agent_score: 20
+  unusual_time_score: 15
+  failed_event_score: 25
+  root_user_activity_score: 30
+  max_risk_score: 100
+
+# Suspicious patterns detection
+patterns:
+  # High-risk AWS API actions that should be monitored
+  high_risk_actions:
+    - CreateUser
+    - DeleteUser
+    - AttachUserPolicy
+    - DetachUserPolicy
+    - CreateAccessKey
+    - DeleteAccessKey
+    - CreateRole
+    - DeleteRole
+    - PutRolePolicy
+    - DeleteRolePolicy
+    - CreateOpenIDConnectProvider
+    - DeleteOpenIDConnectProvider
+    - AssumeRole
+    - AssumeRoleWithWebIdentity
+    - GetSessionToken
+    - CreatePolicy
+    - DeletePolicy
+    - AttachRolePolicy
+    - DetachRolePolicy
+  
+  # Suspicious user agents that might indicate automation or attacks
+  suspicious_user_agents:
+    - curl
+    - wget
+    - python-requests
+    - boto3
+    - aws-cli
+    - terraform
+    - ansible
+    - puppet
+    - chef
+  
+  # Time ranges considered unusual (outside business hours)
+  unusual_times:
+    start_hour: 22  # 10 PM
+    end_hour: 6     # 6 AM
+    timezone: "UTC"
+  
+  # Known suspicious IP ranges (examples - customize for your environment)
+  suspicious_ip_ranges:
+    - "0.0.0.0/8"      # Reserved
+    - "10.0.0.0/8"     # Private (if not expected)
+    - "172.16.0.0/12"  # Private (if not expected)
+    - "192.168.0.0/16" # Private (if not expected)
+  
+  # Countries/regions to monitor (ISO country codes)
+  monitored_countries:
+    - "CN"  # China
+    - "RU"  # Russia
+    - "KP"  # North Korea
+    - "IR"  # Iran
+
+# Environment-specific configurations
+environments:
+  dev:
+    monitoring_level: "standard"
+    alert_threshold: "MEDIUM"
+    auto_response_enabled: false
+    allowed_source_ips: []
+    
+  staging:
+    monitoring_level: "enhanced"
+    alert_threshold: "MEDIUM"
+    auto_response_enabled: false
+    allowed_source_ips: []
+    
+  prod:
+    monitoring_level: "maximum"
+    alert_threshold: "LOW"
+    auto_response_enabled: true
+    allowed_source_ips: []
+
+# IAM compliance rules
+iam_compliance:
+  # Users should not have direct policy attachments
+  allow_user_policies: false
+  
+  # Maximum number of access keys per user
+  max_access_keys_per_user: 1
+  
+  # Access key rotation period (days)
+  access_key_rotation_days: 90
+  
+  # Roles that should not exist or should be monitored
+  prohibited_role_patterns:
+    - "*Admin*"
+    - "*Root*"
+    - "*PowerUser*"
+  
+  # Policies that should not be attached to roles
+  prohibited_policies:
+    - "arn:aws:iam::aws:policy/AdministratorAccess"
+    - "arn:aws:iam::aws:policy/PowerUserAccess"
+  
+  # Required tags for IAM resources
+  required_tags:
+    - "Environment"
+    - "Project"
+    - "Owner"
+
+# GitHub Actions security rules
+github_actions:
+  # Allowed repositories that can assume roles
+  allowed_repositories:
+    - "your-org/homebrew-bottles-sync"
+  
+  # Required conditions for OIDC trust policies
+  required_conditions:
+    - "token.actions.githubusercontent.com:aud"
+    - "token.actions.githubusercontent.com:sub"
+  
+  # Maximum session duration for GitHub Actions roles (seconds)
+  max_session_duration: 3600
+  
+  # Required permission boundaries
+  require_permission_boundary: true
+
+# Notification configuration
+notifications:
+  # Slack configuration
+  slack:
+    enabled: true
+    webhook_url_env: "SLACK_WEBHOOK_URL"
+    channels:
+      critical: "#security-alerts"
+      high: "#security-alerts"
+      medium: "#security-monitoring"
+      low: "#security-monitoring"
+    
+    # Message formatting
+    include_details: true
+    include_recommendations: true
+    max_events_in_message: 5
+  
+  # Email configuration
+  email:
+    enabled: true
+    email_env: "NOTIFICATION_EMAIL"
+    severity_threshold: "HIGH"
+    
+    # Email templates
+    subject_template: "🚨 Security Alert: {severity} - {title}"
+    include_full_details: true
+  
+  # CloudWatch Logs configuration
+  cloudwatch:
+    enabled: true
+    log_group_prefix: "/aws/security-monitor"
+    retention_days: 90
+    
+    # Structured logging
+    include_event_details: true
+    include_risk_scores: true
+
+# Automated response configuration
+automated_response:
+  enabled: false  # Enable with caution
+  
+  # Actions to take for different severity levels
+  actions:
+    critical:
+      - "create_incident"
+      - "notify_security_team"
+      - "disable_suspicious_access"  # Requires careful implementation
+    
+    high:
+      - "create_incident"
+      - "notify_security_team"
+    
+    medium:
+      - "log_event"
+      - "notify_monitoring_team"
+    
+    low:
+      - "log_event"
+
+# Compliance frameworks
+compliance:
+  # SOC 2 Type II requirements
+  soc2:
+    enabled: true
+    requirements:
+      - "access_logging"
+      - "change_monitoring"
+      - "incident_response"
+      - "vulnerability_management"
+  
+  # ISO 27001 requirements
+  iso27001:
+    enabled: false
+    requirements:
+      - "access_control"
+      - "cryptography"
+      - "incident_management"
+      - "supplier_relationships"
+  
+  # Custom compliance requirements
+  custom:
+    enabled: true
+    requirements:
+      - "github_actions_monitoring"
+      - "iam_compliance"
+      - "secrets_management"
+      - "environment_isolation"
+
+# Reporting configuration
+reporting:
+  # Daily security summary
+  daily_summary:
+    enabled: true
+    time: "09:00"
+    timezone: "UTC"
+    include_trends: true
+  
+  # Weekly security report
+  weekly_report:
+    enabled: true
+    day: "monday"
+    time: "09:00"
+    timezone: "UTC"
+    include_compliance_status: true
+  
+  # Monthly compliance report
+  monthly_report:
+    enabled: true
+    day: 1
+    time: "09:00"
+    timezone: "UTC"
+    include_recommendations: true
+
+# Integration settings
+integrations:
+  # AWS Config integration
+  aws_config:
+    enabled: false
+    rules:
+      - "iam-user-no-policies-check"
+      - "iam-policy-no-statements-with-admin-access"
+      - "root-access-key-check"
+  
+  # AWS Security Hub integration
+  security_hub:
+    enabled: false
+    findings_format: "ASFF"
+    
+  # Third-party SIEM integration
+  siem:
+    enabled: false
+    endpoint: ""
+    api_key_env: "SIEM_API_KEY"
+    format: "json"
+
+# Testing and validation
+testing:
+  # Enable test mode (reduces alert sensitivity)
+  test_mode: false
+  
+  # Synthetic security events for testing
+  synthetic_events:
+    enabled: false
+    frequency_minutes: 60
+    
+  # Validation rules
+  validation:
+    check_config_syntax: true
+    validate_patterns: true
+    test_notifications: false

@@ -1,0 +1,269 @@
+name: Deployment Validation
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment for validation'
+        required: true
+        type: string
+      fail_on_drift:
+        description: 'Fail validation if drift is detected'
+        required: false
+        type: boolean
+        default: false
+      skip_aws_checks:
+        description: 'Skip AWS-dependent checks'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      validation_passed:
+        description: 'Whether all validations passed'
+        value: ${{ jobs.validate.outputs.passed }}
+      drift_detected:
+        description: 'Whether infrastructure drift was detected'
+        value: ${{ jobs.validate.outputs.drift_detected }}
+      estimated_cost:
+        description: 'Estimated monthly cost'
+        value: ${{ jobs.validate.outputs.estimated_cost }}
+      validation_report:
+        description: 'Validation report JSON'
+        value: ${{ jobs.validate.outputs.report }}
+
+jobs:
+  validate:
+    name: Validate Deployment
+    runs-on: ubuntu-latest
+    outputs:
+      passed: ${{ steps.validation.outputs.passed }}
+      drift_detected: ${{ steps.validation.outputs.drift_detected }}
+      estimated_cost: ${{ steps.validation.outputs.estimated_cost }}
+      report: ${{ steps.validation.outputs.report }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyyaml boto3 detect-secrets
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ~1.6.0
+      
+      - name: Install security tools
+        run: |
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          
+          # Install terraform tools
+          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
+      
+      - name: Configure AWS credentials (if available)
+        if: inputs.skip_aws_checks == false
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_ARN_{0}', upper(inputs.environment))] }}
+          role-session-name: GitHubActions-Validation-${{ inputs.environment }}
+          aws-region: ${{ inputs.environment == 'dev' && 'us-west-2' || 'us-east-1' }}
+        continue-on-error: true
+      
+      - name: Run comprehensive deployment validation
+        id: validation
+        run: |
+          echo "🔍 Running deployment validation for ${{ inputs.environment }}..."
+          
+          # Prepare validation arguments
+          VALIDATION_ARGS="${{ inputs.environment }} --report validation-report.json"
+          
+          if [ "${{ inputs.fail_on_drift }}" == "true" ]; then
+            VALIDATION_ARGS="$VALIDATION_ARGS --fail-on-drift"
+          fi
+          
+          if [ "${{ inputs.skip_aws_checks }}" == "true" ]; then
+            VALIDATION_ARGS="$VALIDATION_ARGS --skip-aws"
+          fi
+          
+          # Run validation
+          if python scripts/deployment-validator.py $VALIDATION_ARGS; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "✅ Deployment validation passed"
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "❌ Deployment validation failed"
+          fi
+          
+          # Extract key information from validation report
+          if [ -f validation-report.json ]; then
+            # Extract drift detection result
+            DRIFT_DETECTED=$(python -c "
+import json
+try:
+    with open('validation-report.json') as f:
+        data = json.load(f)
+        drift = data.get('validations', {}).get('drift_detection', {}).get('drift_detected', False)
+        print('true' if drift else 'false')
+except:
+    print('false')
+")
+            
+            # Extract estimated cost
+            ESTIMATED_COST=$(python -c "
+import json
+try:
+    with open('validation-report.json') as f:
+        data = json.load(f)
+        cost = data.get('validations', {}).get('cost_estimation', {}).get('estimated_cost', 0)
+        print(f'{cost:.2f}')
+except:
+    print('0.00')
+")
+            
+            # Create compact report for output
+            COMPACT_REPORT=$(python -c "
+import json
+try:
+    with open('validation-report.json') as f:
+        data = json.load(f)
+        compact = {
+            'environment': data.get('environment'),
+            'summary': data.get('summary'),
+            'drift_detected': data.get('validations', {}).get('drift_detection', {}).get('drift_detected', False),
+            'estimated_cost': data.get('validations', {}).get('cost_estimation', {}).get('estimated_cost', 0)
+        }
+        print(json.dumps(compact))
+except Exception as e:
+    print('{\"error\": \"Failed to parse report\"}')
+")
+            
+            echo "drift_detected=$DRIFT_DETECTED" >> $GITHUB_OUTPUT
+            echo "estimated_cost=$ESTIMATED_COST" >> $GITHUB_OUTPUT
+            echo "report=$COMPACT_REPORT" >> $GITHUB_OUTPUT
+          else
+            echo "drift_detected=false" >> $GITHUB_OUTPUT
+            echo "estimated_cost=0.00" >> $GITHUB_OUTPUT
+            echo "report={\"error\": \"No validation report generated\"}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-validation-report-${{ inputs.environment }}
+          path: validation-report.json
+          retention-days: 30
+      
+      - name: Generate validation summary
+        if: always()
+        run: |
+          echo "## 🔍 Deployment Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Validation Status:** ${{ steps.validation.outputs.passed == 'true' && '✅ Passed' || '❌ Failed' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Drift Detected:** ${{ steps.validation.outputs.drift_detected == 'true' && '⚠️ Yes' || '✅ No' }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Estimated Cost:** \$${{ steps.validation.outputs.estimated_cost }}/month" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f validation-report.json ]; then
+            echo "### 📊 Validation Details" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Parse and display validation results
+            python -c "
+import json
+try:
+    with open('validation-report.json') as f:
+        data = json.load(f)
+        validations = data.get('validations', {})
+        
+        for validation_name, result in validations.items():
+            status = '✅ Passed' if result.get('passed') else '❌ Failed'
+            name = validation_name.replace('_', ' ').title()
+            print(f'- **{name}:** {status}')
+            
+            if not result.get('passed') and result.get('errors'):
+                for error in result['errors'][:3]:  # Show first 3 errors
+                    print(f'  - {error}')
+                if len(result.get('errors', [])) > 3:
+                    print(f'  - ... and {len(result[\"errors\"]) - 3} more errors')
+except Exception as e:
+    print(f'Error parsing validation report: {e}')
+" >> $GITHUB_STEP_SUMMARY
+          fi
+      
+      - name: Comment on PR with validation results
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let comment = `## 🔍 Deployment Validation Results - ${{ inputs.environment }}\n\n`;
+            
+            // Basic results
+            const passed = '${{ steps.validation.outputs.passed }}' === 'true';
+            const driftDetected = '${{ steps.validation.outputs.drift_detected }}' === 'true';
+            const estimatedCost = '${{ steps.validation.outputs.estimated_cost }}';
+            
+            comment += `- **Status:** ${passed ? '✅ Passed' : '❌ Failed'}\n`;
+            comment += `- **Drift Detected:** ${driftDetected ? '⚠️ Yes' : '✅ No'}\n`;
+            comment += `- **Estimated Cost:** $${estimatedCost}/month\n\n`;
+            
+            // Detailed results if available
+            try {
+              if (fs.existsSync('validation-report.json')) {
+                const report = JSON.parse(fs.readFileSync('validation-report.json', 'utf8'));
+                const validations = report.validations || {};
+                
+                comment += `### Validation Details\n\n`;
+                
+                for (const [validationName, result] of Object.entries(validations)) {
+                  const status = result.passed ? '✅' : '❌';
+                  const name = validationName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                  comment += `- **${name}:** ${status}\n`;
+                  
+                  if (!result.passed && result.errors && result.errors.length > 0) {
+                    for (const error of result.errors.slice(0, 2)) {
+                      comment += `  - ${error}\n`;
+                    }
+                    if (result.errors.length > 2) {
+                      comment += `  - ... and ${result.errors.length - 2} more issues\n`;
+                    }
+                  }
+                }
+                
+                // Recommendations
+                if (report.recommendations && report.recommendations.length > 0) {
+                  comment += `\n### 💡 Recommendations\n\n`;
+                  for (const rec of report.recommendations) {
+                    comment += `- ${rec}\n`;
+                  }
+                }
+              }
+            } catch (error) {
+              comment += `\n*Could not parse detailed validation results*\n`;
+            }
+            
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+      
+      - name: Fail job if validation failed
+        if: steps.validation.outputs.passed != 'true'
+        run: |
+          echo "❌ Deployment validation failed for ${{ inputs.environment }}"
+          exit 1

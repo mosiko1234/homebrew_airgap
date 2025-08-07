@@ -384,8 +384,8 @@ class HashFileManager:
                 logging.warning(f"Failed to parse default hash file: {e}")
         
         return False    
-   
- def validate_external_hash_file(self, data: Dict) -> tuple[bool, List[str]]:
+    
+    def validate_external_hash_file(self, data: Dict) -> tuple[bool, List[str]]:
         """
         Validate external hash file format and content.
         

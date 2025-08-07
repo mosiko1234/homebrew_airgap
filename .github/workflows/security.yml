@@ -1,0 +1,344 @@
+name: Security Testing
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Run security tests daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_call:
+    inputs:
+      fail_on_high:
+        description: 'Fail the workflow if high-severity issues are found'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  terraform-security:
+    name: Terraform Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install tfsec
+        run: |
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          sudo mv tfsec /usr/local/bin/
+      
+      - name: Install checkov
+        run: |
+          pip install checkov
+      
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      
+      - name: Run Terraform security tests
+        run: |
+          python -m pytest tests/security/test_terraform_security.py -v --tb=short
+        continue-on-error: true
+      
+      - name: Upload Terraform security results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: terraform-security-results
+          path: |
+            terraform-security-*.json
+            terraform-security-*.txt
+          retention-days: 30
+
+  dependency-security:
+    name: Dependency Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install security tools
+        run: |
+          pip install safety pip-audit
+      
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      
+      - name: Run dependency security tests
+        run: |
+          python -m pytest tests/security/test_dependency_security.py -v --tb=short
+        continue-on-error: true
+      
+      - name: Upload dependency security results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: dependency-security-results
+          path: |
+            dependency-security-*.json
+            dependency-security-*.txt
+          retention-days: 30
+
+  secrets-detection:
+    name: Secrets Detection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for git history analysis
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install truffleHog
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+      
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      
+      - name: Run secrets detection tests
+        run: |
+          python -m pytest tests/security/test_secrets_detection.py -v --tb=short
+        continue-on-error: true
+      
+      - name: Upload secrets detection results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: secrets-detection-results
+          path: |
+            secrets-detection-*.json
+            secrets-detection-*.txt
+          retention-days: 30
+
+  comprehensive-security:
+    name: Comprehensive Security Report
+    runs-on: ubuntu-latest
+    needs: [terraform-security, dependency-security, secrets-detection]
+    if: always()
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install security tools
+        run: |
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          sudo mv tfsec /usr/local/bin/
+          
+          # Install checkov
+          pip install checkov
+          
+          # Install dependency security tools
+          pip install safety pip-audit
+          
+          # Install truffleHog
+          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh | sh -s -- -b /usr/local/bin
+      
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest
+      
+      - name: Run comprehensive security tests
+        run: |
+          cd tests/security
+          python security_test_runner.py --output ../../security_test_results.json
+        continue-on-error: true
+      
+      - name: Upload comprehensive security results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: comprehensive-security-results
+          path: |
+            security_test_results.json
+          retention-days: 30
+      
+      - name: Comment PR with security results
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            
+            try {
+              const results = JSON.parse(fs.readFileSync('security_test_results.json', 'utf8'));
+              const summary = results.summary || {};
+              
+              const scoreEmoji = {
+                'SECURE': '✅',
+                'LOW_RISK': '🟡',
+                'MEDIUM_RISK': '🟠',
+                'HIGH_RISK': '🔴',
+                'CRITICAL': '💀'
+              };
+              
+              const score = summary.security_score || 'UNKNOWN';
+              const emoji = scoreEmoji[score] || '❓';
+              
+              const comment = `## ${emoji} Security Test Results
+              
+              **Overall Security Score:** ${score}
+              
+              ### 📊 Test Statistics
+              - Total tests run: ${summary.total_tests_run || 0}
+              - Tests passed: ${summary.tests_passed || 0}
+              - Tests failed: ${summary.tests_failed || 0}
+              - Tests with warnings: ${summary.tests_with_warnings || 0}
+              
+              ### 🚨 Issues Found
+              - Critical: ${(summary.critical_issues || []).length}
+              - High: ${(summary.high_issues || []).length}
+              - Medium: ${(summary.medium_issues || []).length}
+              - Low: ${(summary.low_issues || []).length}
+              
+              ### 📋 Category Results
+              - Terraform Security: ${results.terraform_security?.overall_status?.toUpperCase() || 'UNKNOWN'}
+              - Dependency Security: ${results.dependency_security?.overall_status?.toUpperCase() || 'UNKNOWN'}
+              - Secrets Detection: ${results.secrets_detection?.overall_status?.toUpperCase() || 'UNKNOWN'}
+              
+              ${(summary.critical_issues || []).length > 0 ? `
+              ### 💀 Critical Issues (Must Fix)
+              ${(summary.critical_issues || []).slice(0, 5).map(issue => 
+                `- ${issue.file || 'Unknown'}: ${issue.issue || issue.description || 'Unknown issue'}`
+              ).join('\n')}
+              ` : ''}
+              
+              <details>
+              <summary>View detailed results</summary>
+              
+              Full security test results are available in the workflow artifacts.
+              
+              </details>`;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } catch (error) {
+              console.log('Failed to post security results comment:', error);
+            }
+      
+      - name: Fail on critical issues
+        run: |
+          if [ -f security_test_results.json ]; then
+            critical_count=$(python -c "
+            import json
+            with open('security_test_results.json') as f:
+              data = json.load(f)
+            print(len(data.get('summary', {}).get('critical_issues', [])))
+            ")
+            
+            if [ "$critical_count" -gt 0 ]; then
+              echo "❌ Found $critical_count critical security issues"
+              exit 1
+            fi
+            
+            if [ "${{ inputs.fail_on_high }}" = "true" ]; then
+              high_count=$(python -c "
+              import json
+              with open('security_test_results.json') as f:
+                data = json.load(f)
+              print(len(data.get('summary', {}).get('high_issues', [])))
+              ")
+              
+              if [ "$high_count" -gt 0 ]; then
+                echo "❌ Found $high_count high-severity security issues"
+                exit 1
+              fi
+            fi
+          fi
+
+  notify-security-results:
+    name: Notify Security Results
+    runs-on: ubuntu-latest
+    needs: [comprehensive-security]
+    if: always() && (github.ref == 'refs/heads/main' || github.event_name == 'schedule')
+    
+    steps:
+      - name: Download security results
+        uses: actions/download-artifact@v3
+        with:
+          name: comprehensive-security-results
+      
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [ -f security_test_results.json ]; then
+            python -c "
+            import json
+            import requests
+            import os
+            
+            with open('security_test_results.json') as f:
+              results = json.load(f)
+            
+            summary = results.get('summary', {})
+            score = summary.get('security_score', 'UNKNOWN')
+            
+            score_emoji = {
+              'SECURE': '✅',
+              'LOW_RISK': '🟡', 
+              'MEDIUM_RISK': '🟠',
+              'HIGH_RISK': '🔴',
+              'CRITICAL': '💀'
+            }
+            
+            emoji = score_emoji.get(score, '❓')
+            
+            message = {
+              'text': f'{emoji} Security Test Results - {score}',
+              'blocks': [
+                {
+                  'type': 'section',
+                  'text': {
+                    'type': 'mrkdwn',
+                    'text': f'*Security Test Results*\n*Score:* {emoji} {score}\n*Critical Issues:* {len(summary.get(\"critical_issues\", []))}\n*High Issues:* {len(summary.get(\"high_issues\", []))}'
+                  }
+                }
+              ]
+            }
+            
+            webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+            if webhook_url:
+              requests.post(webhook_url, json=message)
+            "
+          fi

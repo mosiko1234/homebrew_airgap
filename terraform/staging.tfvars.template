@@ -1,0 +1,43 @@
+# Staging Environment Configuration Template
+# This file is generated from config.yaml - do not edit manually
+
+# Project Configuration
+project_name = "homebrew-bottles-sync"
+project_description = "Automated Homebrew bottles sync system"
+environment = "staging"
+
+# AWS Configuration
+aws_region = "us-east-1"
+
+# Sync Configuration
+size_threshold_gb = 15
+schedule_expression = "cron(0 3 ? * SAT *)"
+
+# Resource Configuration - Production-like but with some optimizations
+lambda_orchestrator_memory = 512
+lambda_sync_memory = 3008
+lambda_timeout = 900
+
+ecs_task_cpu = 2048
+ecs_task_memory = 8192
+ecs_ephemeral_storage = 100
+
+# Cost Optimization
+enable_fargate_spot = true
+auto_shutdown = false
+
+# Notifications
+slack_enabled = true
+slack_channel = "#platform-updates"
+email_enabled = true
+email_addresses = ["devops@company.com"]
+
+# Security Settings
+enable_vpc_flow_logs = true
+enable_cloudtrail = true
+encryption_at_rest = true
+encryption_in_transit = true
+
+# Cost Management
+cost_threshold_usd = 100
+enable_cost_alerts = true

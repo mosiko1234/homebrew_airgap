@@ -1,0 +1,420 @@
+name: Deployment Approval Workflow
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: string
+      commit_sha:
+        description: 'Commit SHA to deploy'
+        required: true
+        type: string
+      validation_report:
+        description: 'Validation report JSON'
+        required: false
+        type: string
+      estimated_cost:
+        description: 'Estimated monthly cost'
+        required: false
+        type: string
+        default: 'Unknown'
+      drift_detected:
+        description: 'Whether infrastructure drift was detected'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      approved:
+        description: 'Whether deployment was approved'
+        value: ${{ jobs.approval.outputs.approved }}
+      approval_comment:
+        description: 'Approval comment from reviewer'
+        value: ${{ jobs.approval.outputs.comment }}
+
+jobs:
+  pre-approval-validation:
+    name: Pre-Approval Validation
+    runs-on: ubuntu-latest
+    outputs:
+      validation_passed: ${{ steps.validate.outputs.passed }}
+      validation_summary: ${{ steps.validate.outputs.summary }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit_sha }}
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyyaml boto3
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ~1.6.0
+      
+      - name: Install security tools
+        run: |
+          # Install tfsec
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+          
+          # Install detect-secrets
+          pip install detect-secrets
+      
+      - name: Run deployment validation
+        id: validate
+        run: |
+          echo "🔍 Running deployment validation for ${{ inputs.environment }}..."
+          
+          # Run validation with report generation
+          if python scripts/deployment-validator.py ${{ inputs.environment }} \
+             --report validation-report.json \
+             --skip-aws; then
+            echo "passed=true" >> $GITHUB_OUTPUT
+            echo "✅ Validation passed"
+          else
+            echo "passed=false" >> $GITHUB_OUTPUT
+            echo "❌ Validation failed"
+          fi
+          
+          # Generate summary for approval issue
+          if [ -f validation-report.json ]; then
+            SUMMARY=$(python -c "
+import json
+with open('validation-report.json') as f:
+    data = json.load(f)
+    summary = data['summary']
+    print(f\"**Validation Results:**\n- Total: {summary['total_validations']}\n- Passed: {summary['passed_validations']}\n- Failed: {summary['failed_validations']}\n- Success Rate: {summary['success_rate']}\")
+")
+            echo "summary<<EOF" >> $GITHUB_OUTPUT
+            echo "$SUMMARY" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "summary=Validation report not available" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Upload validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-validation-report-${{ inputs.environment }}
+          path: validation-report.json
+          retention-days: 30
+
+  approval:
+    name: Deployment Approval
+    runs-on: ubuntu-latest
+    needs: pre-approval-validation
+    if: inputs.environment == 'prod' || (inputs.environment == 'staging' && inputs.drift_detected)
+    environment: 
+      name: approval-${{ inputs.environment }}
+    outputs:
+      approved: ${{ steps.approval.outputs.approved }}
+      comment: ${{ steps.approval.outputs.comment }}
+    
+    steps:
+      - name: Create approval issue
+        id: create-issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ inputs.environment }}';
+            const commitSha = '${{ inputs.commit_sha }}';
+            const estimatedCost = '${{ inputs.estimated_cost }}';
+            const driftDetected = '${{ inputs.drift_detected }}' === 'true';
+            const validationPassed = '${{ needs.pre-approval-validation.outputs.validation_passed }}' === 'true';
+            const validationSummary = `${{ needs.pre-approval-validation.outputs.validation_summary }}`;
+            
+            // Determine required approvers based on environment
+            let requiredApprovers = [];
+            let minimumApprovals = 1;
+            
+            if (environment === 'prod') {
+              requiredApprovers = ['${{ secrets.PROD_APPROVERS }}'].filter(Boolean);
+              minimumApprovals = 2;
+            } else if (environment === 'staging') {
+              requiredApprovers = ['${{ secrets.STAGING_APPROVERS }}'].filter(Boolean);
+              minimumApprovals = 1;
+            }
+            
+            // Create issue body
+            let issueBody = `## 🚀 Deployment Approval Request\n\n`;
+            issueBody += `**Environment:** \`${environment}\`\n`;
+            issueBody += `**Commit:** \`${commitSha}\`\n`;
+            issueBody += `**Estimated Cost:** $${estimatedCost}/month\n`;
+            issueBody += `**Infrastructure Drift:** ${driftDetected ? '⚠️ Yes' : '✅ No'}\n`;
+            issueBody += `**Pre-Validation:** ${validationPassed ? '✅ Passed' : '❌ Failed'}\n\n`;
+            
+            if (validationSummary) {
+              issueBody += `### Validation Summary\n${validationSummary}\n\n`;
+            }
+            
+            issueBody += `### 📋 Deployment Checklist\n\n`;
+            issueBody += `Please review the following before approving:\n\n`;
+            issueBody += `- [ ] Code changes have been reviewed\n`;
+            issueBody += `- [ ] Tests are passing\n`;
+            issueBody += `- [ ] Security scans are clean\n`;
+            issueBody += `- [ ] Cost impact is acceptable\n`;
+            
+            if (driftDetected) {
+              issueBody += `- [ ] Infrastructure drift has been reviewed and is acceptable\n`;
+            }
+            
+            if (environment === 'prod') {
+              issueBody += `- [ ] Staging deployment was successful\n`;
+              issueBody += `- [ ] Rollback plan is ready\n`;
+              issueBody += `- [ ] Monitoring and alerts are configured\n`;
+            }
+            
+            issueBody += `\n### 🎯 Approval Instructions\n\n`;
+            issueBody += `**Required Approvals:** ${minimumApprovals}\n`;
+            
+            if (requiredApprovers.length > 0) {
+              issueBody += `**Authorized Approvers:** ${requiredApprovers.join(', ')}\n`;
+            }
+            
+            issueBody += `\nTo approve this deployment, comment with:\n`;
+            issueBody += `\`\`\`\n/approve [optional comment]\n\`\`\`\n\n`;
+            issueBody += `To reject this deployment, comment with:\n`;
+            issueBody += `\`\`\`\n/reject [reason]\n\`\`\`\n\n`;
+            
+            issueBody += `### 🔗 Links\n\n`;
+            issueBody += `- [Workflow Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})\n`;
+            issueBody += `- [Commit Details](https://github.com/${{ github.repository }}/commit/${commitSha})\n`;
+            
+            if (!validationPassed) {
+              issueBody += `\n### ⚠️ Validation Warnings\n\n`;
+              issueBody += `Pre-deployment validation failed. Please review the validation report before approving.\n`;
+            }
+            
+            // Create the issue
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `🚀 Deployment Approval: ${environment} - ${commitSha.substring(0, 7)}`,
+              body: issueBody,
+              labels: ['deployment', 'approval', environment],
+              assignees: requiredApprovers
+            });
+            
+            core.setOutput('issue_number', issue.data.number);
+            core.setOutput('issue_url', issue.data.html_url);
+            
+            return issue.data.number;
+      
+      - name: Wait for approval
+        id: approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = ${{ steps.create-issue.outputs.result }};
+            const environment = '${{ inputs.environment }}';
+            const requiredApprovals = environment === 'prod' ? 2 : 1;
+            const timeoutMinutes = environment === 'prod' ? 60 : 30; // Longer timeout for prod
+            const timeoutMs = timeoutMinutes * 60 * 1000;
+            const pollIntervalMs = 30 * 1000; // Check every 30 seconds
+            
+            let approvals = [];
+            let rejections = [];
+            let startTime = Date.now();
+            
+            console.log(`Waiting for ${requiredApprovals} approval(s) for ${environment} deployment...`);
+            console.log(`Timeout: ${timeoutMinutes} minutes`);
+            console.log(`Issue: https://github.com/${{ github.repository }}/issues/${issueNumber}`);
+            
+            while (Date.now() - startTime < timeoutMs) {
+              try {
+                // Get issue comments
+                const comments = await github.rest.issues.listComments({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber
+                });
+                
+                // Reset arrays for this iteration
+                approvals = [];
+                rejections = [];
+                
+                // Process comments
+                for (const comment of comments.data) {
+                  const body = comment.body.trim();
+                  const author = comment.user.login;
+                  
+                  if (body.startsWith('/approve')) {
+                    const approvalComment = body.replace('/approve', '').trim();
+                    approvals.push({
+                      author: author,
+                      comment: approvalComment,
+                      created_at: comment.created_at
+                    });
+                    console.log(`✅ Approval from ${author}: ${approvalComment}`);
+                  } else if (body.startsWith('/reject')) {
+                    const rejectionReason = body.replace('/reject', '').trim();
+                    rejections.push({
+                      author: author,
+                      reason: rejectionReason,
+                      created_at: comment.created_at
+                    });
+                    console.log(`❌ Rejection from ${author}: ${rejectionReason}`);
+                  }
+                }
+                
+                // Check for rejections (any rejection blocks deployment)
+                if (rejections.length > 0) {
+                  const latestRejection = rejections[rejections.length - 1];
+                  
+                  // Add rejection comment to issue
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    body: `❌ **Deployment Rejected**\n\nRejected by: @${latestRejection.author}\nReason: ${latestRejection.reason || 'No reason provided'}\n\nDeployment workflow will be cancelled.`
+                  });
+                  
+                  // Close issue
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    state: 'closed',
+                    labels: ['deployment', 'approval', environment, 'rejected']
+                  });
+                  
+                  core.setOutput('approved', 'false');
+                  core.setOutput('comment', latestRejection.reason || 'Deployment rejected');
+                  core.setFailed(`Deployment rejected by ${latestRejection.author}: ${latestRejection.reason}`);
+                  return;
+                }
+                
+                // Check for sufficient approvals
+                if (approvals.length >= requiredApprovals) {
+                  const approvalSummary = approvals.map(a => `@${a.author}: ${a.comment}`).join('\n');
+                  
+                  // Add approval comment to issue
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    body: `✅ **Deployment Approved**\n\nApprovals received: ${approvals.length}/${requiredApprovals}\n\n${approvalSummary}\n\nDeployment will proceed automatically.`
+                  });
+                  
+                  // Close issue
+                  await github.rest.issues.update({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: issueNumber,
+                    state: 'closed',
+                    labels: ['deployment', 'approval', environment, 'approved']
+                  });
+                  
+                  core.setOutput('approved', 'true');
+                  core.setOutput('comment', approvalSummary);
+                  console.log(`✅ Deployment approved with ${approvals.length} approval(s)`);
+                  return;
+                }
+                
+                // Log current status
+                console.log(`⏳ Waiting... (${approvals.length}/${requiredApprovals} approvals, ${Math.round((timeoutMs - (Date.now() - startTime)) / 1000 / 60)} minutes remaining)`);
+                
+              } catch (error) {
+                console.error('Error checking for approvals:', error);
+              }
+              
+              // Wait before next poll
+              await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+            }
+            
+            // Timeout reached
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              body: `⏰ **Approval Timeout**\n\nDeployment approval timed out after ${timeoutMinutes} minutes.\nReceived ${approvals.length}/${requiredApprovals} approvals.\n\nDeployment workflow will be cancelled.`
+            });
+            
+            // Close issue
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issueNumber,
+              state: 'closed',
+              labels: ['deployment', 'approval', environment, 'timeout']
+            });
+            
+            core.setOutput('approved', 'false');
+            core.setOutput('comment', 'Approval timeout');
+            core.setFailed(`Deployment approval timed out after ${timeoutMinutes} minutes`);
+
+  auto-approve:
+    name: Auto-Approve Non-Production
+    runs-on: ubuntu-latest
+    needs: pre-approval-validation
+    if: inputs.environment != 'prod' && !inputs.drift_detected
+    outputs:
+      approved: ${{ steps.auto-approve.outputs.approved }}
+      comment: ${{ steps.auto-approve.outputs.comment }}
+    
+    steps:
+      - name: Auto-approve deployment
+        id: auto-approve
+        run: |
+          echo "✅ Auto-approving ${{ inputs.environment }} deployment"
+          echo "approved=true" >> $GITHUB_OUTPUT
+          echo "comment=Auto-approved for ${{ inputs.environment }} environment" >> $GITHUB_OUTPUT
+      
+      - name: Log auto-approval
+        uses: actions/github-script@v7
+        with:
+          script: |
+            console.log('🤖 Auto-approved deployment for ${{ inputs.environment }} environment');
+            console.log('Validation passed: ${{ needs.pre-approval-validation.outputs.validation_passed }}');
+            console.log('No infrastructure drift detected');
+
+  approval-summary:
+    name: Approval Summary
+    runs-on: ubuntu-latest
+    needs: [pre-approval-validation, approval, auto-approve]
+    if: always()
+    
+    steps:
+      - name: Generate approval summary
+        run: |
+          echo "## 🎯 Deployment Approval Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ inputs.commit_sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Estimated Cost:** \$${{ inputs.estimated_cost }}/month" >> $GITHUB_STEP_SUMMARY
+          echo "**Drift Detected:** ${{ inputs.drift_detected && '⚠️ Yes' || '✅ No' }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Validation results
+          if [ "${{ needs.pre-approval-validation.outputs.validation_passed }}" == "true" ]; then
+            echo "**Pre-Validation:** ✅ Passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Pre-Validation:** ❌ Failed" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Approval results
+          if [ "${{ needs.approval.outputs.approved }}" == "true" ]; then
+            echo "**Approval Status:** ✅ Approved (Manual)" >> $GITHUB_STEP_SUMMARY
+            echo "**Approval Comment:** ${{ needs.approval.outputs.comment }}" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.auto-approve.outputs.approved }}" == "true" ]; then
+            echo "**Approval Status:** ✅ Approved (Automatic)" >> $GITHUB_STEP_SUMMARY
+            echo "**Approval Comment:** ${{ needs.auto-approve.outputs.comment }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Approval Status:** ❌ Not Approved" >> $GITHUB_STEP_SUMMARY
+            if [ -n "${{ needs.approval.outputs.comment }}" ]; then
+              echo "**Reason:** ${{ needs.approval.outputs.comment }}" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi

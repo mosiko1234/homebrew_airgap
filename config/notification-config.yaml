@@ -1,0 +1,260 @@
+# Notification Configuration for CI/CD Pipeline
+# This file defines notification routing, templates, and settings
+
+# Global notification settings
+global:
+  # Default notification channels based on severity
+  severity_routing:
+    critical: ["slack", "email"]
+    high: ["slack", "email"]
+    medium: ["slack"]
+    low: ["slack"]
+    info: ["slack"]
+  
+  # Rate limiting to prevent notification spam
+  rate_limiting:
+    enabled: true
+    max_notifications_per_hour: 10
+    cooldown_minutes: 5
+  
+  # Retry settings for failed notifications
+  retry:
+    max_attempts: 3
+    backoff_seconds: [5, 15, 30]
+
+# Slack configuration
+slack:
+  # Default webhook URL (set via SLACK_WEBHOOK_URL environment variable)
+  default_webhook: "${SLACK_WEBHOOK_URL}"
+  
+  # Environment-specific channels
+  channels:
+    dev: "${SLACK_DEV_CHANNEL}"
+    staging: "${SLACK_STAGING_CHANNEL}"
+    prod: "${SLACK_PROD_CHANNEL}"
+  
+  # Message formatting
+  formatting:
+    use_threads: false
+    mention_users:
+      critical: ["@channel"]
+      high: ["@here"]
+    
+  # Custom emoji for different notification types
+  emoji:
+    deployment_success: "🚀"
+    deployment_failure: "💥"
+    health_check_failure: "⚠️"
+    smoke_test_failure: "🧪"
+    monitoring_alert: "🔍"
+    cost_alert: "💰"
+
+# Email configuration
+email:
+  # SMTP settings (set via environment variables)
+  smtp:
+    server: "${SMTP_SERVER}"
+    port: "${SMTP_PORT}"
+    username: "${SMTP_USERNAME}"
+    password: "${SMTP_PASSWORD}"
+    from_address: "${FROM_EMAIL}"
+    use_tls: true
+  
+  # Environment-specific recipient lists
+  recipients:
+    dev:
+      - "${DEV_TEAM_EMAIL}"
+    staging:
+      - "${STAGING_TEAM_EMAIL}"
+      - "${QA_TEAM_EMAIL}"
+    prod:
+      - "${PROD_TEAM_EMAIL}"
+      - "${DEVOPS_TEAM_EMAIL}"
+      - "${MANAGEMENT_EMAIL}"
+    
+    # Special recipient lists
+    critical:
+      - "${ONCALL_EMAIL}"
+      - "${INCIDENT_RESPONSE_EMAIL}"
+    security:
+      - "${SECURITY_TEAM_EMAIL}"
+    cost_alerts:
+      - "${FINANCE_TEAM_EMAIL}"
+      - "${DEVOPS_TEAM_EMAIL}"
+  
+  # Email templates customization
+  templates:
+    include_logs: true
+    include_dashboard_links: true
+    max_error_length: 1000
+
+# Environment-specific notification rules
+environments:
+  dev:
+    # Development environment - less noisy notifications
+    severity_override:
+      deployment_failure: "medium"  # Don't wake people up for dev failures
+    
+    channels:
+      deployment_success: ["slack"]
+      deployment_failure: ["slack"]
+      health_check_failure: ["slack"]
+      smoke_test_failure: ["slack"]
+    
+    # Quiet hours (no notifications during these times)
+    quiet_hours:
+      enabled: true
+      start: "22:00"
+      end: "08:00"
+      timezone: "UTC"
+      exceptions: ["critical"]  # Still send critical alerts
+  
+  staging:
+    # Staging environment - moderate notifications
+    channels:
+      deployment_success: ["slack"]
+      deployment_failure: ["slack", "email"]
+      health_check_failure: ["slack"]
+      smoke_test_failure: ["slack", "email"]
+    
+    # Business hours only for non-critical alerts
+    business_hours_only:
+      enabled: true
+      start: "09:00"
+      end: "18:00"
+      timezone: "UTC"
+      weekdays_only: true
+      exceptions: ["critical", "high"]
+  
+  prod:
+    # Production environment - full notifications
+    severity_override:
+      deployment_failure: "critical"  # All prod failures are critical
+      health_check_failure: "high"
+    
+    channels:
+      deployment_success: ["slack", "email"]
+      deployment_failure: ["slack", "email"]
+      health_check_failure: ["slack", "email"]
+      smoke_test_failure: ["slack", "email"]
+      monitoring_alert: ["slack", "email"]
+      cost_alert: ["slack", "email"]
+    
+    # Always send notifications for production
+    quiet_hours:
+      enabled: false
+
+# Notification types configuration
+notification_types:
+  deployment_success:
+    description: "Successful deployment notification"
+    default_severity: "medium"
+    include_metrics: true
+    
+  deployment_failure:
+    description: "Failed deployment notification"
+    default_severity: "high"
+    include_logs: true
+    include_rollback_info: true
+    
+  health_check_failure:
+    description: "Health check failure notification"
+    default_severity: "medium"
+    include_failed_checks: true
+    
+  smoke_test_failure:
+    description: "Smoke test failure notification"
+    default_severity: "medium"
+    include_test_results: true
+    
+  monitoring_alert:
+    description: "General monitoring alert"
+    default_severity: "medium"
+    
+  cost_alert:
+    description: "Cost threshold exceeded alert"
+    default_severity: "medium"
+    include_cost_breakdown: true
+    include_optimization_tips: true
+
+# Integration settings
+integrations:
+  # PagerDuty integration for critical alerts
+  pagerduty:
+    enabled: false
+    integration_key: "${PAGERDUTY_INTEGRATION_KEY}"
+    severity_threshold: "critical"
+  
+  # Microsoft Teams integration
+  teams:
+    enabled: false
+    webhook_url: "${TEAMS_WEBHOOK_URL}"
+    environments: ["prod"]
+  
+  # Jira integration for automatic ticket creation
+  jira:
+    enabled: false
+    server_url: "${JIRA_SERVER_URL}"
+    username: "${JIRA_USERNAME}"
+    api_token: "${JIRA_API_TOKEN}"
+    project_key: "DEVOPS"
+    create_tickets_for: ["deployment_failure", "health_check_failure"]
+
+# Dashboard and reporting
+dashboard:
+  base_url: "${DASHBOARD_BASE_URL}"
+  paths:
+    environment: "/environments/{environment}"
+    logs: "/logs/{environment}"
+    costs: "/costs/{environment}"
+    metrics: "/metrics/{environment}"
+    deployments: "/deployments/{environment}"
+
+# Monitoring and alerting thresholds
+thresholds:
+  deployment:
+    max_duration_minutes: 30
+    success_rate_warning: 90  # Warn if success rate drops below 90%
+    success_rate_critical: 80  # Critical if success rate drops below 80%
+  
+  health_checks:
+    max_failed_checks: 2
+    max_duration_minutes: 5
+  
+  smoke_tests:
+    max_failed_tests: 1
+    max_duration_minutes: 10
+  
+  costs:
+    # Monthly cost thresholds in USD
+    dev: 500
+    staging: 1000
+    prod: 5000
+    
+    # Alert when costs exceed percentage of threshold
+    warning_percentage: 80
+    critical_percentage: 100
+
+# Notification content customization
+content:
+  # Include additional context in notifications
+  include_git_info: true
+  include_user_info: true
+  include_duration: true
+  include_previous_status: true
+  
+  # Links to include in notifications
+  links:
+    runbook: "${RUNBOOK_BASE_URL}"
+    monitoring: "${MONITORING_BASE_URL}"
+    logs: "${LOGS_BASE_URL}"
+    documentation: "${DOCS_BASE_URL}"
+  
+  # Custom fields to include
+  custom_fields:
+    - name: "Build Number"
+      value: "${BUILD_NUMBER}"
+    - name: "Pipeline URL"
+      value: "${PIPELINE_URL}"
+    - name: "Commit Author"
+      value: "${COMMIT_AUTHOR}"

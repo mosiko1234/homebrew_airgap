@@ -1,0 +1,45 @@
+# Development Environment Configuration Template
+# This file is generated from config.yaml - do not edit manually
+
+# Project Configuration
+project_name = "homebrew-bottles-sync"
+project_description = "Automated Homebrew bottles sync system"
+environment = "dev"
+
+# AWS Configuration
+aws_region = "us-west-2"
+
+# Sync Configuration
+size_threshold_gb = 5
+schedule_expression = "cron(0 */6 * * ? *)"
+
+# Resource Configuration - Optimized for development
+lambda_orchestrator_memory = 512
+lambda_sync_memory = 3008
+lambda_timeout = 900
+
+ecs_task_cpu = 1024  # Reduced for cost optimization
+ecs_task_memory = 4096  # Reduced for cost optimization
+ecs_ephemeral_storage = 50  # Reduced for cost optimization
+
+# Cost Optimization
+enable_fargate_spot = true
+auto_shutdown = true
+dev_shutdown_schedule = "cron(0 20 * * MON-FRI)"
+dev_startup_schedule = "cron(0 8 * * MON-FRI)"
+
+# Notifications
+slack_enabled = true
+slack_channel = "#platform-updates"
+email_enabled = true
+email_addresses = ["devops@company.com"]
+
+# Security Settings
+enable_vpc_flow_logs = true
+enable_cloudtrail = true
+encryption_at_rest = true
+encryption_in_transit = true
+
+# Cost Management
+cost_threshold_usd = 50  # Lower threshold for dev
+enable_cost_alerts = true
